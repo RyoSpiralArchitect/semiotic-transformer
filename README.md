@@ -13,8 +13,10 @@ Difference/Meaning fields, Greimas semiotic squares, and a multi-path meaning ch
 * **MeaningField** – acts like an attractor potential that biases both the attention
   mechanism and the meaning-chain recomposition.
 * **SemioticSquare constraints** – optional metric regularisers over vocabulary
-  slots that keep A/¬A/B/¬B relationships coherent. When enabled you can also learn a
-  linear **Negation** operator that behaves like an involution and maps A → ¬A.
+  slots that keep A/¬A/B/¬B relationships coherent. You can attach multiple squares
+  at once (pass `squares=[...]` when building the model). When enabled you can also
+  learn a linear **Negation** operator that behaves like an involution and maps
+  A → ¬A.
 * **MeaningChainLayer** – separates denotation, connotation, and mythic pathways and
   recombines them with a learned softmax gate.
 
@@ -35,8 +37,8 @@ julia> SemioticTransformer.toy_train()
 
 By default the toy example wires a SemioticSquare over the first four vocabulary
 indices and enables the Negation operator. The helper `lossfn(model, sequence)` will
-shift the sequence internally (tokens `1:n-1` predict `2:n`), add the square loss,
-and apply the negation regulariser.
+shift the sequence internally (tokens `1:n-1` predict `2:n`), add the summed square
+loss across all registered squares, and apply the negation regulariser.
 
 If you want manual control over the training pairs you can call the more explicit
 method:
@@ -44,6 +46,15 @@ method:
 ```julia
 context, targets = SemioticTransformer.next_token_pairs(sequence)
 loss = SemioticTransformer.lossfn(model, context, targets; λ_square=0.05f0, λ_neg=0.01f0)
+```
+
+To supervise more than one semiotic relation simultaneously, pass a collection of
+`SemioticSquare`s via the `squares` keyword (or the legacy `square` for a single
+constraint):
+
+```julia
+squares = [SemioticSquare(1, 2, 3, 4), SemioticSquare(5, 6, 7, 8)]
+model = SemioticModel(vocab, d; squares=squares, use_negation=true)
 ```
 
 ## Notes
