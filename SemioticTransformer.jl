@@ -55,6 +55,16 @@ function difference_matrix(df::DifferenceField, X::AbstractMatrix{T})
     return D
 end
 
+function difference_matrix(df::DifferenceField, X::AbstractArray{T,3})
+    n = size(X, 2)
+    batches = size(X, 3)
+    D = Array{T}(undef, n, n, batches)
+    @inbounds @views for b in 1:batches
+        D[:, :, b] = difference_matrix(df, view(X, :, :, b))
+    end
+    return D
+end
+
 # -----------------------------
 # Meaning field: ポテンシャルΦとその勾配
 # -----------------------------
@@ -81,6 +91,16 @@ function potential(mf::MeaningField, X::AbstractMatrix{T})
             s += -mf.w[t] * (δ' * δ)
         end
         Φ[j] = mf.scale * s
+    end
+    return Φ
+end
+
+function potential(mf::MeaningField, X::AbstractArray{T,3})
+    n = size(X, 2)
+    batches = size(X, 3)
+    Φ = zeros(T, n, batches)
+    @inbounds @views for b in 1:batches
+        Φ[:, b] = potential(mf, view(X, :, :, b))
     end
     return Φ
 end
@@ -179,15 +199,26 @@ end
 
 "X: d×n, Φ: n → Y: d×n"
 function (m::MeaningChainLayer)(X::AbstractMatrix{T}, Φ::AbstractVector{T})
-    d, n = size(X)
     Φrow = reshape(Φ, 1, :)
-    # 基本の3経路
     d0 = m.den(X)                           # 直写（denotation）
     c0 = m.con(X) .* (1 .+ Φrow)            # 文脈で増幅（connotation）
     y0 = m.myth(c0)                          # 物語的再符号化（myth）
-    # ゲート合成
     α = NNlib.softmax(m.α)
     return α[1] .* d0 .+ α[2] .* c0 .+ α[3] .* y0
+end
+
+"X: d×n×b, Φ: n×b → Y: d×n×b"
+function (m::MeaningChainLayer)(X::AbstractArray{T,3}, Φ::AbstractMatrix{T})
+    d, n, batches = size(X)
+    cols = n * batches
+    Xflat = reshape(X, d, cols)
+    Φrow = reshape(vec(Φ), 1, cols)
+    d0 = m.den(Xflat)
+    c0 = m.con(Xflat) .* (1 .+ Φrow)
+    y0 = m.myth(c0)
+    α = NNlib.softmax(m.α)
+    out = α[1] .* d0 .+ α[2] .* c0 .+ α[3] .* y0
+    return reshape(out, d, n, batches)
 end
 
 # -----------------------------
@@ -215,29 +246,45 @@ end
 
 "X: d×n, Φ: n → Y: d×n"
 function (sa::SemioticAttention)(X::AbstractMatrix{T}, Φ::AbstractVector{T})
-    # 線形射
     Q = sa.WQ * X   # dk×n
     K = sa.WK * X   # dk×n
     V = sa.WV * X   # dv×n
     dk = size(Q, 1)
 
-    # 通常相関
     S = (Q' * K) ./ sqrt(T(dk))  # n×n（query×key）
-
-    # 差異場（keys空間で）
     D = difference_matrix(sa.df, K)  # n×n
-
-    # 意味ポテンシャル（i,j）→ (Φ_i + Φ_j)/2
     Φrow = reshape(Φ, 1, :)
     Φpair = (Φrow .+ Φrow') .* 0.5f0  # n×n
-
-    # スコア合成
     A = S .- sa.β .* D .+ sa.γ .* Φpair
 
-    # 正規化＆適用
-    P = NNlib.softmax(A; dims=2)       # 各query行でsoftmax
-    Yv = V * P'                        # dv×n
-    return sa.WO * Yv                  # d×n
+    P = NNlib.softmax(A; dims=2)
+    Yv = V * P'
+    return sa.WO * Yv
+end
+
+"X: d×n×b, Φ: n×b → Y: d×n×b"
+function (sa::SemioticAttention)(X::AbstractArray{T,3}, Φ::AbstractMatrix{T})
+    d, n, batches = size(X)
+    cols = n * batches
+    dk = size(sa.WQ, 1)
+    dv = size(sa.WV, 1)
+    Xflat = reshape(X, d, cols)
+    Q = reshape(sa.WQ * Xflat, dk, n, batches)
+    K = reshape(sa.WK * Xflat, dk, n, batches)
+    V = reshape(sa.WV * Xflat, dv, n, batches)
+    D = difference_matrix(sa.df, K)
+    Y = Array{T}(undef, d, n, batches)
+    inv_sqrt = T(1) / sqrt(T(dk))
+    @inbounds for b in 1:batches
+        Φcol = view(Φ, :, b)
+        Φrow = reshape(Φcol, 1, :)
+        S = (Q[:, :, b]' * K[:, :, b]) .* inv_sqrt
+        A = S .- sa.β .* view(D, :, :, b) .+ sa.γ .* (Φrow .+ Φrow') .* 0.5f0
+        P = NNlib.softmax(A; dims=2)
+        Yv = V[:, :, b] * P'
+        Y[:, :, b] = sa.WO * Yv
+    end
+    return Y
 end
 
 # -----------------------------
@@ -261,12 +308,32 @@ function SemioticBlock(d::Int; dk::Int=div(d,2), h::Int=d, k::Int=8)
     )
 end
 
+_apply_layernorm(norm::LayerNorm, X::AbstractMatrix{T}) where {T} = norm(X)
+function _apply_layernorm(norm::LayerNorm, X::AbstractArray{T,3}) where {T}
+    d, n, batches = size(X)
+    cols = n * batches
+    return reshape(norm(reshape(X, d, cols)), d, n, batches)
+end
+
+_apply_dense(layer::Dense, X::AbstractMatrix{T}) where {T} = layer(X)
+function _apply_dense(layer::Dense, X::AbstractArray{T,3}) where {T}
+    d, n, batches = size(X)
+    cols = n * batches
+    return reshape(layer(reshape(X, d, cols)), size(layer.weight, 1), n, batches)
+end
+
 "X: d×n → d×n"
 function (b::SemioticBlock)(X::AbstractMatrix{T})
     Φ = potential(b.mf, X)
-    Y = X .+ b.attn(b.norm1(X), Φ)
-    Z = Y .+ b.chain(b.norm2(Y), Φ)
-    return Z
+    Y = X .+ b.attn(_apply_layernorm(b.norm1, X), Φ)
+    return Y .+ b.chain(_apply_layernorm(b.norm2, Y), Φ)
+end
+
+"X: d×n×b → d×n×b"
+function (b::SemioticBlock)(X::AbstractArray{T,3})
+    Φ = potential(b.mf, X)
+    Y = X .+ b.attn(_apply_layernorm(b.norm1, X), Φ)
+    return Y .+ b.chain(_apply_layernorm(b.norm2, Y), Φ)
 end
 
 # -----------------------------
@@ -283,6 +350,13 @@ struct SemioticModel
 end
 @functor SemioticModel
 
+function (emb::Embedding)(tokens::AbstractMatrix{<:Integer})
+    seq_len, batches = size(tokens)
+    d = size(emb.weight, 1)
+    X = emb(vec(tokens))
+    return reshape(X, d, seq_len, batches)
+end
+
 function SemioticModel(vocab::Int, d::Int; layers::Int=2, dk::Int=div(d,2), h::Int=d, k::Int=8, classes::Int=vocab, square=nothing, squares=nothing, use_negation::Bool=false)
     blocks = [SemioticBlock(d; dk=dk, h=h, k=k) for _ in 1:layers]
     neg = use_negation ? Negation(d) : nothing
@@ -298,33 +372,71 @@ function SemioticModel(vocab::Int, d::Int; layers::Int=2, dk::Int=div(d,2), h::I
 end
 
 "tokens: n（Int）→ logits: classes×n"
-function (m::SemioticModel)(tokens::AbstractVector{Int})
+function (m::SemioticModel)(tokens::AbstractVector{<:Integer})
     X = m.emb(tokens)             # d×n
     for b in m.blocks
-        X = b(X)                  # d×n
+        X = b(X)
     end
-    X = m.ln(X)                   # d×n
-    return m.proj(X)              # classes×n
+    X = _apply_layernorm(m.ln, X)
+    return _apply_dense(m.proj, X)
+end
+
+"tokens: (n×b) → logits: classes×n×b"
+function (m::SemioticModel)(tokens::AbstractMatrix{<:Integer})
+    X = m.emb(tokens)
+    for b in m.blocks
+        X = b(X)
+    end
+    X = _apply_layernorm(m.ln, X)
+    return _apply_dense(m.proj, X)
 end
 
 # -----------------------------
 # Loss (CE + square制約 + negation 正則化)
 # -----------------------------
-function next_token_pairs(tokens::Vector{Int})
+function next_token_pairs(tokens::AbstractVector{<:Integer})
     length(tokens) > 1 || error("Need at least two tokens to form training pairs")
     return tokens[1:end-1], tokens[2:end]
 end
 
-function lossfn(m::SemioticModel, tokens::Vector{Int}, targets::Vector{Int}; λ_square = T(0.1), λ_neg=T(0.05))
-    logits = m(tokens)                      # C×n
-    Lce = Flux.logitcrossentropy(logits, onehotbatch(targets, 1:size(logits,1)))
+function next_token_pairs(tokens::AbstractMatrix{<:Integer})
+    size(tokens, 1) > 1 || error("Need at least two tokens to form training pairs")
+    return tokens[1:end-1, :], tokens[2:end, :]
+end
+
+_ce_loss(logits::AbstractMatrix{T}, targets::AbstractVector{<:Integer}) where {T} =
+    Flux.logitcrossentropy(logits, onehotbatch(targets, 1:size(logits, 1)))
+
+function _ce_loss(logits::AbstractArray{T,3}, targets::AbstractMatrix{<:Integer}) where {T}
+    classes = size(logits, 1)
+    cols = size(logits, 2) * size(logits, 3)
+    flat_logits = reshape(logits, classes, cols)
+    return Flux.logitcrossentropy(flat_logits, onehotbatch(vec(targets), 1:classes))
+end
+
+function lossfn(m::SemioticModel, tokens::AbstractVector{<:Integer}, targets::AbstractVector{<:Integer}; λ_square = T(0.1), λ_neg=T(0.05))
+    logits = m(tokens)
+    Lce = _ce_loss(logits, targets)
     Lsq = square_penalty(m.emb.weight, m.squares)
     Lneg = negation_penalty(m.neg, m.emb.weight, m.squares)
     return Lce + λ_square * Lsq + λ_neg * Lneg
 end
 
-function lossfn(m::SemioticModel, sequence::Vector{Int}; kwargs...)
+function lossfn(m::SemioticModel, tokens::AbstractMatrix{<:Integer}, targets::AbstractMatrix{<:Integer}; λ_square = T(0.1), λ_neg=T(0.05))
+    logits = m(tokens)
+    Lce = _ce_loss(logits, targets)
+    Lsq = square_penalty(m.emb.weight, m.squares)
+    Lneg = negation_penalty(m.neg, m.emb.weight, m.squares)
+    return Lce + λ_square * Lsq + λ_neg * Lneg
+end
+
+function lossfn(m::SemioticModel, sequence::AbstractVector{<:Integer}; kwargs...)
     context, targets = next_token_pairs(sequence)
+    return lossfn(m, context, targets; kwargs...)
+end
+
+function lossfn(m::SemioticModel, sequences::AbstractMatrix{<:Integer}; kwargs...)
+    context, targets = next_token_pairs(sequences)
     return lossfn(m, context, targets; kwargs...)
 end
 

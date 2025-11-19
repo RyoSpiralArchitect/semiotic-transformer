@@ -48,6 +48,18 @@ context, targets = SemioticTransformer.next_token_pairs(sequence)
 loss = SemioticTransformer.lossfn(model, context, targets; λ_square=0.05f0, λ_neg=0.01f0)
 ```
 
+### Mini-batching
+
+Every forward/loss helper also accepts a matrix of tokens whose columns represent
+different sequences (shape `sequence_length × batch`). The `next_token_pairs`
+utility and the loss function will shift each column independently and the model
+returns logits shaped `classes × sequence_length × batch`.
+
+```julia
+sequences = hcat([1, 2, 5, 6], [2, 3, 4, 1])
+loss = SemioticTransformer.lossfn(model, sequences; λ_square=0.05f0)
+```
+
 To supervise more than one semiotic relation simultaneously, pass a collection of
 `SemioticSquare`s via the `squares` keyword (or the legacy `square` for a single
 constraint):
