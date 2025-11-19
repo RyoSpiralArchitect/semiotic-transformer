@@ -38,17 +38,21 @@ DifferenceField(d::Int; φ = NNlib.softplus) = DifferenceField(Matrix{T}(I, d, d
 
 "X: d×n（列がトークン）。D: n×n の差異行列。"
 function difference_matrix(df::DifferenceField, X::AbstractMatrix{T})
-    d, n = size(X)
+    _, n = size(X)
     M = df.M
     D = Matrix{T}(undef, n, n)
-    @inbounds for i in 1:n
-        xi = view(X, :, i)
-        for j in 1:n
-            Δ = xi .- view(X, :, j)
-            D[i, j] = dot(Δ, M * Δ)
+    @inbounds @views for i in 1:n
+        xi = X[:, i]
+        D[i, i] = df.φ(zero(T))
+        i == n && continue
+        for j in (i + 1):n
+            Δ = xi .- X[:, j]
+            val = df.φ(dot(Δ, M * Δ))
+            D[i, j] = val
+            D[j, i] = val
         end
     end
-    return df.φ.(D)
+    return D
 end
 
 # -----------------------------
@@ -122,6 +126,39 @@ function square_loss(X::AbstractMatrix{T}, sq::SemioticSquare; margin_contra=T(2
     L_impl = (NNlib.relu(d(A, nB) .- margin_imp)^2 + NNlib.relu(d(B, nA) .- margin_imp)^2)
 
     return L_contra + L_contrary + L_impl
+end
+
+function negation_loss(neg::Negation, X::AbstractMatrix{T}, sq::SemioticSquare; λ_involution=T(0.1))
+    pairs = ((sq.s1, sq.ns1), (sq.s2, sq.ns2))
+    loss = zero(T)
+    @inbounds @views for (pos_idx, neg_idx) in pairs
+        pos = X[:, pos_idx]
+        negv = X[:, neg_idx]
+        diff_pos = neg.N * pos .- negv
+        diff_neg = neg.N * negv .- pos
+        loss += sum(diff_pos .^ 2) + sum(diff_neg .^ 2)
+    end
+    Id = Matrix{T}(I, size(neg.N, 1), size(neg.N, 2))
+    involution = neg.N * neg.N .- Id
+    return loss + λ_involution * sum(involution .^ 2)
+end
+
+function square_penalty(X::AbstractMatrix{T}, squares::Vector{SemioticSquare})
+    isempty(squares) && return zero(T)
+    loss = zero(T)
+    @inbounds for sq in squares
+        loss += square_loss(X, sq)
+    end
+    return loss
+end
+
+function negation_penalty(neg::Union{Nothing,Negation}, X::AbstractMatrix{T}, squares::Vector{SemioticSquare})
+    (neg === nothing || isempty(squares)) && return zero(T)
+    loss = zero(T)
+    @inbounds for sq in squares
+        loss += negation_loss(neg, X, sq)
+    end
+    return loss
 end
 
 # -----------------------------
@@ -241,13 +278,23 @@ struct SemioticModel
     blocks::Vector{SemioticBlock}
     ln::LayerNorm
     proj::Dense
-    square::Union{Nothing, SemioticSquare}
+    squares::Vector{SemioticSquare}
+    neg::Union{Nothing, Negation}
 end
 @functor SemioticModel
 
-function SemioticModel(vocab::Int, d::Int; layers::Int=2, dk::Int=div(d,2), h::Int=d, k::Int=8, classes::Int=vocab, square::Union{Nothing,SemioticSquare}=nothing)
+function SemioticModel(vocab::Int, d::Int; layers::Int=2, dk::Int=div(d,2), h::Int=d, k::Int=8, classes::Int=vocab, square=nothing, squares=nothing, use_negation::Bool=false)
     blocks = [SemioticBlock(d; dk=dk, h=h, k=k) for _ in 1:layers]
-    SemioticModel(Flux.Embedding(vocab, d), blocks, LayerNorm(d), Dense(d, classes), square)
+    neg = use_negation ? Negation(d) : nothing
+    sqs = SemioticSquare[]
+    if squares !== nothing
+        for sq in squares
+            push!(sqs, sq)
+        end
+    elseif square !== nothing
+        push!(sqs, square)
+    end
+    SemioticModel(Flux.Embedding(vocab, d), blocks, LayerNorm(d), Dense(d, classes), sqs, neg)
 end
 
 "tokens: n（Int）→ logits: classes×n"
@@ -261,13 +308,24 @@ function (m::SemioticModel)(tokens::AbstractVector{Int})
 end
 
 # -----------------------------
-# Loss (CE + square制約)
+# Loss (CE + square制約 + negation 正則化)
 # -----------------------------
-function lossfn(m::SemioticModel, tokens::Vector{Int}, targets::Vector{Int}; λ_square = T(0.1))
+function next_token_pairs(tokens::Vector{Int})
+    length(tokens) > 1 || error("Need at least two tokens to form training pairs")
+    return tokens[1:end-1], tokens[2:end]
+end
+
+function lossfn(m::SemioticModel, tokens::Vector{Int}, targets::Vector{Int}; λ_square = T(0.1), λ_neg=T(0.05))
     logits = m(tokens)                      # C×n
     Lce = Flux.logitcrossentropy(logits, onehotbatch(targets, 1:size(logits,1)))
-    Lsq = (m.square === nothing) ? 0f0 : square_loss(m.emb.weight, m.square) # ここでは語彙エンベ上に制約を入れる例
-    return Lce + λ_square * Lsq
+    Lsq = square_penalty(m.emb.weight, m.squares)
+    Lneg = negation_penalty(m.neg, m.emb.weight, m.squares)
+    return Lce + λ_square * Lsq + λ_neg * Lneg
+end
+
+function lossfn(m::SemioticModel, sequence::Vector{Int}; kwargs...)
+    context, targets = next_token_pairs(sequence)
+    return lossfn(m, context, targets; kwargs...)
 end
 
 # -----------------------------
@@ -283,18 +341,17 @@ function toy_train(; seed=42)
     vocab = 8; d=64
     # 例: 1:hot, 2:cold, 3:not_hot, 4:not_cold を四角形に
     sq = SemioticSquare(1, 2, 3, 4)
-    m = SemioticModel(vocab, d; layers=2, square=sq)
+    m = SemioticModel(vocab, d; layers=2, square=sq, use_negation=true)
 
-    tokens  = [1,2,5,6,7,3,4,2]               # n=8
-    targets = [2,1,5,6,7,4,3,1]               # 適当な次トークン予測風
+    sequence = [1,2,5,6,7,3,4,2,1]            # n=9（1トークン分シフトして教師を作る）
     opt = Flux.setup(Flux.Optimisers.Adam(1e-3), m)
 
     gs = Flux.gradient(Flux.params(m)) do
-        lossfn(m, tokens, targets; λ_square=0.05f0)
+        lossfn(m, sequence; λ_square=0.05f0, λ_neg=0.01f0)
     end
     Flux.update!(opt, Flux.params(m), gs)
 
-    @info "Step OK" loss = lossfn(m, tokens, targets; λ_square=0.05f0)
+    @info "Step OK" loss = lossfn(m, sequence; λ_square=0.05f0, λ_neg=0.01f0)
     return m
 end
 
