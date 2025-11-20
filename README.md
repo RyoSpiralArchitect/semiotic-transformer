@@ -67,6 +67,15 @@ context, targets = SemioticTransformer.next_token_pairs(sequence)
 loss, parts = SemioticTransformer.lossfn(model, context, targets; λ_square=0.05f0, λ_neg=0.01f0)
 ```
 
+The loss helper now accepts `update_field` and `will` flags so you can decide
+whether MeaningField prototypes are refreshed and the Will-flow step is applied
+during the supervised forward pass (both default to `false` and `true`,
+respectively):
+
+```julia
+loss, parts = SemioticTransformer.lossfn(model, sequence; update_field=true, will=false)
+```
+
 ### Mini-batching
 
 Every forward/loss helper also accepts a matrix of tokens whose columns represent

@@ -304,20 +304,6 @@ function will_step!(X::AbstractArray{T,3}, mf::MeaningField, df::DifferenceField
     return X
 end
 
-"X: d×n×b, Φ: n×b → Y: d×n×b"
-function (m::MeaningChainLayer)(X::AbstractArray{T,3}, Φ::AbstractMatrix{T})
-    d, n, batches = size(X)
-    cols = n * batches
-    Xflat = reshape(X, d, cols)
-    Φrow = reshape(vec(Φ), 1, cols)
-    d0 = m.den(Xflat)
-    c0 = m.con(Xflat) .* (1 .+ Φrow)
-    y0 = m.myth(c0)
-    α = NNlib.softmax(m.α)
-    out = α[1] .* d0 .+ α[2] .* c0 .+ α[3] .* y0
-    return reshape(out, d, n, batches)
-end
-
 # -----------------------------
 # D) Fechner/Weber: JND constraint
 # -----------------------------
@@ -653,8 +639,8 @@ function _negation_penalty(blocks::Vector{SemioticBlock}; kw...)
     return L
 end
 
-function lossfn(m::SemioticModel, tokens::AbstractVector{<:Integer}, targets::AbstractVector{<:Integer}; λ_square=T(0.05), λ_neg=T(1e-3), λ_KL=T(1e-3), λ_rec=T(1e-2), λ_self=T(1e-2), λ_jnd=T(1e-3), pad_token::Union{Nothing,Int}=nothing)
-    logits, KL, recL, X = forward(m, tokens; update_field=false, will=true)
+function lossfn(m::SemioticModel, tokens::AbstractVector{<:Integer}, targets::AbstractVector{<:Integer}; λ_square=T(0.05), λ_neg=T(1e-3), λ_KL=T(1e-3), λ_rec=T(1e-2), λ_self=T(1e-2), λ_jnd=T(1e-3), pad_token::Union{Nothing,Int}=nothing, update_field::Bool=false, will::Bool=true)
+    logits, KL, recL, X = forward(m, tokens; update_field=update_field, will=will)
     Lce = _ce_loss(logits, targets; pad_token=pad_token)
     top_block = m.blocks[end]
     Lself = _self_loss_block(top_block, X)
@@ -665,8 +651,8 @@ function lossfn(m::SemioticModel, tokens::AbstractVector{<:Integer}, targets::Ab
     return L, (; Lce, KL, recL, Lsq, Lneg, Lself, Ljnd)
 end
 
-function lossfn(m::SemioticModel, tokens::AbstractMatrix{<:Integer}, targets::AbstractMatrix{<:Integer}; λ_square=T(0.05), λ_neg=T(1e-3), λ_KL=T(1e-3), λ_rec=T(1e-2), λ_self=T(1e-2), λ_jnd=T(1e-3), pad_token::Union{Nothing,Int}=nothing)
-    logits, KL, recL, X = forward(m, tokens; update_field=false, will=true)
+function lossfn(m::SemioticModel, tokens::AbstractMatrix{<:Integer}, targets::AbstractMatrix{<:Integer}; λ_square=T(0.05), λ_neg=T(1e-3), λ_KL=T(1e-3), λ_rec=T(1e-2), λ_self=T(1e-2), λ_jnd=T(1e-3), pad_token::Union{Nothing,Int}=nothing, update_field::Bool=false, will::Bool=true)
+    logits, KL, recL, X = forward(m, tokens; update_field=update_field, will=will)
     Lce = _ce_loss(logits, targets; pad_token=pad_token)
     top_block = m.blocks[end]
     Lself = _self_loss_block(top_block, X)
