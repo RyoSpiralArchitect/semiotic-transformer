@@ -33,11 +33,11 @@ multi-path meaning recomposition.
 
 ## Quick start
 
-The module does not ship with a package `Project.toml`; simply include the file
-and use the module directly:
+Instantiate the bundled `Project.toml` so Flux/Functors/NNlib are available,
+then load the module:
 
 ```julia
-julia> include("SemioticTransformer.jl"); using .SemioticTransformer
+julia --project=. -e 'using Pkg; Pkg.instantiate(); include("SemioticTransformer.jl"); using .SemioticTransformer'
 ```
 
 You can then run the toy optimiser step:
@@ -177,4 +177,11 @@ archetypal constructors:
 pairs = [(1, 3), (2, 4), (1, 6)]  # Self×Shadow, Persona×Anima, Self×Trickster
 m = Archetypal.ArchetypalModel(vocab, d; allowed_pairs=pairs, r=48)
 ```
+
+## CI quick check
+
+A minimal GitHub Actions workflow (`.github/workflows/ci.yml`) is provided to
+instantiate the environment and ensure `SemioticTransformer.jl` loads cleanly
+via `include`. This guards against syntax slips in the monolithic module even
+when no standalone tests are present.
 
