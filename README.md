@@ -33,9 +33,11 @@ multi-path meaning recomposition.
 
 ## Quick start
 
-Instantiate the bundled `Project.toml` so Flux/Functors/NNlib are available.
-If you have a stale `Manifest.toml` lying around, resolve first to repopulate
-missing entries (e.g., `Functors`):
+Including `SemioticTransformer.jl` will, by default, activate and instantiate the
+local project so dependencies like Flux/Functors/NNlib are present. You can skip
+this bootstrap by setting `SEMIOTIC_BOOTSTRAP=0` if you are already in an
+active environment. To make the dependency setup explicit (and refresh a stale
+`Manifest.toml`), resolve and instantiate first:
 
 ```julia
 julia --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate(); include("SemioticTransformer.jl"); using .SemioticTransformer'

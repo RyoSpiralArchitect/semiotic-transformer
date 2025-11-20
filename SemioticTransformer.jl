@@ -1,3 +1,18 @@
+"""
+Bootstrap the local project so `include("SemioticTransformer.jl")` works even when the
+repository has not been activated yet. Set `SEMIOTIC_BOOTSTRAP=0` to skip automatic
+activation/instantiation (for example, inside an already-active environment).
+"""
+if get(ENV, "SEMIOTIC_BOOTSTRAP", "1") != "0"
+    import Pkg
+    try
+        Pkg.activate(@__DIR__)
+        Pkg.instantiate()
+    catch err
+        @warn "SemioticTransformer bootstrap failed—dependencies may be missing" error=err
+    end
+end
+
 module SemioticTransformer
 
 using Flux
