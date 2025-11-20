@@ -142,7 +142,9 @@ Key ideas:
   into a scene space `r`, mixes pairwise Hadamard products with router weights,
   and lifts the composed scene back to the global space. `λ_mono` controls the
   (soft) unit/associativity regulariser, while `λ_pair` scales the scene add-on
-  in the block constructor.
+  in the block constructor. Use `allowed_pairs` in the archetypal constructors to
+  prune the set of archetype interactions (default is all pairs) when you want
+  to avoid the full `O(K^2)` scene mixing.
 * **JND + Negation regularisers** – the global DifferenceField receives the
   same Weber-style `jnd_loss`, while local and global Negation operators are
   kept involutive/isometric via `negation_penalty`.
@@ -168,4 +170,11 @@ You can tweak the archetypal geometry by adjusting the rule weight
 (`λ_rules`), the category/functor weight (`λ_struct`), the monoid penalty
 (`λ_mono`), the scene scale (`λ_pair`) and dimensionality (`r`), or the router
 temperature (`τ`) inside `ArchetypeRouter` for harder or softer routing.
+To trim the number of scene interactions, supply `allowed_pairs` to the
+archetypal constructors:
+
+```julia
+pairs = [(1, 3), (2, 4), (1, 6)]  # Self×Shadow, Persona×Anima, Self×Trickster
+m = Archetypal.ArchetypalModel(vocab, d; allowed_pairs=pairs, r=48)
+```
 

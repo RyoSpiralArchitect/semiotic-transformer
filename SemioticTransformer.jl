@@ -707,7 +707,7 @@ end
 module Archetypal
 
 using Flux, LinearAlgebra, Random, NNlib, Functors
-using ..: T, Negation, negation_penalty, DifferenceField,
+using ..SemioticTransformer: T, Negation, negation_penalty, DifferenceField,
     difference_matrix, MeaningField, potential, potential_grad, update!,
     MeaningChainLayer, SelfField, coniunctio, _apply_layernorm, _apply_dense,
     next_token_pairs, _ce_loss
@@ -944,11 +944,16 @@ struct SceneMonoid
     P::Vector{Matrix{T}}    # K×(r×ds) projections
     e::Vector{T}            # unit element (≈1)
     λ_pair::T
+    pairs::Vector{Tuple{Int, Int}}
 end
 @functor SceneMonoid
 
-function SceneMonoid(d::Int, ds::Int, K::Int, r::Int; λ_pair=T(0.5))
-    SceneMonoid(Flux.glorot_uniform(d, r), [Flux.glorot_uniform(r, ds) for _ in 1:K], ones(T, r), λ_pair)
+function SceneMonoid(d::Int, ds::Int, K::Int, r::Int; λ_pair=T(0.5), allowed_pairs::Union{Nothing,Vector{Tuple{Int,Int}}}=nothing)
+    raw_pairs = isnothing(allowed_pairs) ? [(a, b) for a in 1:K-1 for b in (a + 1):K] :
+        [(min(a, b), max(a, b)) for (a, b) in allowed_pairs if 1 <= a <= K && 1 <= b <= K && a != b]
+    uniq = sort!(collect(Set(raw_pairs)); by=x -> (x[1], x[2]))
+    isempty(uniq) && (uniq = [(a, b) for a in 1:K-1 for b in (a + 1):K])
+    SceneMonoid(Flux.glorot_uniform(d, r), [Flux.glorot_uniform(r, ds) for _ in 1:K], ones(T, r), λ_pair, uniq)
 end
 
 """Compose pairwise scene interactions for a single sequence."""
@@ -960,7 +965,7 @@ function scene_compose(sm::SceneMonoid, locals::Vector{<:AbstractMatrix{T}}, W::
     rsum = zeros(T, rdim, n)
     @inbounds for i in 1:n
         wi = view(W, :, i)
-        for a in 1:K-1, b in (a + 1):K
+        for (a, b) in sm.pairs
             wpair = wi[a] * wi[b]
             if wpair > 0
                 rsum[:, i] .+= wpair .* (view(R[a], :, i) .* view(R[b], :, i))
@@ -982,7 +987,7 @@ function scene_compose(sm::SceneMonoid, locals::Vector{<:AbstractArray{T,3}}, W:
         rsum = zeros(T, rdim, n)
         for i in 1:n
             wi = view(W, :, i, b)
-            for a in 1:K-1, c in (a + 1):K
+            for (a, c) in sm.pairs
                 wpair = wi[a] * wi[c]
                 if wpair > 0
                     rsum[:, i] .+= wpair .* (view(R[a], :, i) .* view(R[c], :, i))
@@ -1049,9 +1054,16 @@ struct ArchetypalBlock
 end
 @functor ArchetypalBlock
 
-function ArchetypalBlock(d::Int; K::Int=6, ds::Int=div(d, 2), r::Int=32, λ_pair::T=0.5f0)
+function ArchetypalBlock(d::Int; K::Int=6, ds::Int=div(d, 2), r::Int=32, λ_pair::T=0.5f0,
+        allowed_pairs::Union{Nothing,Vector{Tuple{Int,Int}}}=nothing)
     units = [ArchetypeUnit(UInt8(i), d, ds) for i in 1:K]
-    ArchetypalBlock(units, ArchetypeRouter(d, K), SceneMonoid(d, ds, K, r; λ_pair=λ_pair), DifferenceField(d), Negation(d))
+    ArchetypalBlock(
+        units,
+        ArchetypeRouter(d, K),
+        SceneMonoid(d, ds, K, r; λ_pair=λ_pair, allowed_pairs=allowed_pairs),
+        DifferenceField(d),
+        Negation(d),
+    )
 end
 
 function (ab::ArchetypalBlock)(X::AbstractMatrix{T}; will::Bool=true, update_fields::Bool=false)
@@ -1128,8 +1140,14 @@ struct ArchetypalModel
 end
 @functor ArchetypalModel
 
-function ArchetypalModel(vocab::Int, d::Int; K::Int=6, ds::Int=div(d, 2), r::Int=32, λ_pair::T=0.5f0, classes::Int=vocab)
-    ArchetypalModel(Flux.Embedding(vocab, d), ArchetypalBlock(d; K=K, ds=ds, r=r, λ_pair=λ_pair), Flux.LayerNorm(d), Dense(d, classes))
+function ArchetypalModel(vocab::Int, d::Int; K::Int=6, ds::Int=div(d, 2), r::Int=32, λ_pair::T=0.5f0, classes::Int=vocab,
+        allowed_pairs::Union{Nothing,Vector{Tuple{Int,Int}}}=nothing)
+    ArchetypalModel(
+        Flux.Embedding(vocab, d),
+        ArchetypalBlock(d; K=K, ds=ds, r=r, λ_pair=λ_pair, allowed_pairs=allowed_pairs),
+        Flux.LayerNorm(d),
+        Dense(d, classes),
+    )
 end
 
 function forward(m::ArchetypalModel, tokens::AbstractVector{<:Integer}; update_fields::Bool=false, will::Bool=true)
