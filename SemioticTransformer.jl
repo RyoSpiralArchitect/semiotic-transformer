@@ -707,10 +707,10 @@ end
 module Archetypal
 
 using Flux, LinearAlgebra, Random, NNlib, Functors
-using ..SemioticTransformer: T, Negation, negation_penalty, DifferenceField,
-    difference_matrix, MeaningField, potential, potential_grad, update!,
-    MeaningChainLayer, SelfField, coniunctio, _apply_layernorm, _apply_dense,
-    next_token_pairs, _ce_loss
+import ..SemioticTransformer
+using ..SemioticTransformer: T, Negation, negation_penalty, DifferenceField, difference_matrix,
+    MeaningField, potential, potential_grad, update!, MeaningChainLayer, SelfField, coniunctio,
+    _apply_layernorm, _apply_dense, next_token_pairs, _ce_loss
 
 struct Obj
     d::Int
