@@ -33,11 +33,20 @@ multi-path meaning recomposition.
 
 ## Quick start
 
-Instantiate the bundled `Project.toml` so Flux/Functors/NNlib are available,
-then load the module:
+Instantiate the bundled `Project.toml` so Flux/Functors/NNlib are available.
+If you have a stale `Manifest.toml` lying around, resolve first to repopulate
+missing entries (e.g., `Functors`):
 
 ```julia
-julia --project=. -e 'using Pkg; Pkg.instantiate(); include("SemioticTransformer.jl"); using .SemioticTransformer'
+julia --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate(); include("SemioticTransformer.jl"); using .SemioticTransformer'
+```
+
+Alternatively, run the helper script which activates the project, resolves, and
+installs dependencies before returning control to the REPL:
+
+```bash
+julia scripts/instantiate.jl
+julia --project=. -e 'include("SemioticTransformer.jl"); using .SemioticTransformer'
 ```
 
 You can then run the toy optimiser step:

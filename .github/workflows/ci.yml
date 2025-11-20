@@ -12,7 +12,7 @@ jobs:
       - uses: julia-actions/setup-julia@v2
         with:
           version: '1.12'
-      - name: Install dependencies
-        run: julia --project=. -e 'using Pkg; Pkg.instantiate()'
+      - name: Resolve and install dependencies
+        run: julia --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate()'
       - name: Compile and load
         run: julia --project=. -e 'include("SemioticTransformer.jl"); println("Loaded OK")'

@@ -901,7 +901,9 @@ function _unit_forward(u::ArchetypeUnit, Xg::AbstractArray{T,3}; will::Bool=true
     locals = Array{T}(undef, u.ds, size(Xg, 2), batches)
     globals = Array{T}(undef, size(u.F.U, 1), size(Xg, 2), batches)
     @inbounds @views for b in 1:batches
-        locals[:, :, b], globals[:, :, b] = _unit_forward(u, view(Xg, :, :, b); will=will, update_field=update_field)
+        loc, glob = _unit_forward(u, view(Xg, :, :, b); will=will, update_field=update_field)
+        locals[:, :, b] .= loc
+        globals[:, :, b] .= glob
     end
     return locals, globals
 end
