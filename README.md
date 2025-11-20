@@ -119,3 +119,37 @@ model = SemioticModel(vocab, d; squares=squares)
   small perturbations are neither collapsed nor exaggerated by the difference
   metric.
 
+## Archetypal subcategories (V4) inside `SemioticTransformer`
+
+The archetypal "V4" variant now lives directly inside `SemioticTransformer`
+as the `SemioticTransformer.Archetypal` submodule. Each archetype is treated as
+its own small category (local space `d_sub`) with dedicated
+Negation/Meaning/Difference fields, a SemioticMHA, and a SelfField. A functor
+(`U`, `V`) lifts each local morphism into the global space (`d`), and a router
+produces per-token mixture weights across the archetypal units.
+
+Key ideas:
+
+* **Category + functor penalties** – `category_penalty` enforces associativity
+  and identity on local morphisms; `functor_penalty` encourages the lifted
+  morphisms to commute (`F(g∘f) ≈ F(g)∘F(f)`).
+* **Archetype rules** – `archetype_rules_loss` ties together Self/Persona/
+  Shadow/Anima/Animus/Trickster centers (after lifting to the global space) via
+  coniunctio/negation relations and margin constraints.
+* **Router** – `ArchetypeRouter` outputs soft assignments per token so the
+  block behaves like a Mixture-of-Experts over archetypal subcategories.
+* **JND + Negation regularisers** – the global DifferenceField receives the
+  same Weber-style `jnd_loss`, while local and global Negation operators are
+  kept involutive/isometric via `negation_penalty`.
+
+Minimal usage:
+
+```julia
+julia> include("SemioticTransformer.jl"); using .SemioticTransformer.Archetypal
+julia> m = Archetypal.toy_train()
+```
+
+You can tweak the archetypal geometry by adjusting the rule weight
+(`λ_rules`), the category/functor weight (`λ_struct`), or the router temperature
+(`τ`) inside `ArchetypeRouter` for harder or softer routing.
+

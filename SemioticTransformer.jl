@@ -701,4 +701,332 @@ function toy_train(; seed=7)
     return m
 end
 
+# =============================
+# Archetypal subcategories (V4)
+# =============================
+module Archetypal
+
+using Flux, LinearAlgebra, Random, NNlib, Functors
+using ..: T, Negation, negation_penalty, DifferenceField,
+    difference_matrix, MeaningField, potential, potential_grad, update!,
+    MeaningChainLayer, SelfField, coniunctio
+
+struct Obj
+    d::Int
+end
+
+struct Morphism
+    dom::Obj
+    cod::Obj
+    A::Matrix{T}
+end
+@functor Morphism
+
+id(o::Obj) = Morphism(o, o, Matrix{T}(I, o.d, o.d))
+
+compose(g::Morphism, f::Morphism) =
+    (f.cod.d == g.dom.d) ? Morphism(f.dom, g.cod, g.A * f.A) :
+    throw(DimensionMismatch("compose: cod(f)!=dom(g)"))
+
+function category_penalty(f::Morphism, g::Morphism, h::Morphism; λ_assoc=T(1e-3), λ_id=T(1e-3))
+    lhs = compose(compose(h, g), f).A
+    rhs = compose(h, compose(g, f)).A
+    L_assoc = norm(lhs .- rhs)^2
+    I_dom = id(f.dom).A
+    I_cod = id(f.cod).A
+    L_id = norm(f.A - f.A * I_dom)^2 + norm(f.A - I_cod * f.A)^2
+    λ_assoc * L_assoc + λ_id * L_id
+end
+
+struct Functor
+    U::Matrix{T}
+    V::Matrix{T}
+end
+@functor Functor
+
+functor_map(F::Functor, f::Morphism) =
+    Morphism(Obj(size(F.U, 1)), Obj(size(F.U, 1)), F.U * f.A * F.V)
+
+function functor_penalty(F::Functor, f::Morphism, g::Morphism; λ=T(1e-3))
+    lhs = functor_map(F, compose(g, f)).A
+    rhs = functor_map(F, g).A * functor_map(F, f).A
+    λ * norm(lhs .- rhs)^2
+end
+
+@enum HeadRole::UInt8 begin
+    Contradiction = 1
+    Contrary = 2
+    Implication = 3
+end
+
+struct SemioticHead
+    WQ::Matrix{T}
+    WK::Matrix{T}
+    WV::Matrix{T}
+    df::DifferenceField
+    β::T
+    γ::T
+    η::T
+    role::HeadRole
+end
+@functor SemioticHead
+
+function SemioticHead(d::Int, dk::Int, dv::Int, role::HeadRole; β=T(0.2), γ=T(0.2), η=T(0.2))
+    SemioticHead(
+        Flux.glorot_uniform(dk, d),
+        Flux.glorot_uniform(dk, d),
+        Flux.glorot_uniform(dv, d),
+        DifferenceField(dk),
+        β,
+        γ,
+        η,
+        role,
+    )
+end
+
+struct SemioticMHA
+    heads::Vector{SemioticHead}
+    WO::Matrix{T}
+    neg::Negation
+end
+@functor SemioticMHA
+
+function SemioticMHA(d::Int; H::Int=3, dk::Int=div(d, H), dv::Int=div(d, H))
+    roles = [Contradiction, Contrary, Implication][1:H]
+    hs = [
+        SemioticHead(d, dk, dv, r;
+            β = r == Contradiction ? T(0.8) : r == Contrary ? T(0.4) : T(0.2),
+            γ = r == Implication ? T(0.6) : T(0.2),
+            η = T(0.3),
+        ) for r in roles
+    ]
+    SemioticMHA(hs, Flux.glorot_uniform(d, dv * H), Negation(d))
+end
+
+neg_penalty(mha::SemioticMHA; kw...) = negation_penalty(mha.neg; kw...)
+
+function role_bias(h::SemioticHead, Q::AbstractMatrix{T}, K::AbstractMatrix{T}, Φ::AbstractVector{T}, neg::Negation)
+    n = size(Q, 2)
+    Φrow = reshape(Φ, 1, :)
+    Φpair = (Φrow .+ Φrow') .* 0.5f0
+    S = (Q' * K) ./ sqrt(T(size(Q, 1)))
+    D = difference_matrix(h.df, K)
+    R = zeros(T, n, n)
+    if h.role == Implication
+        NK = negate(neg, K)
+        S_imp = (Q' * NK) ./ sqrt(T(size(Q, 1)))
+        R .= h.η .* S_imp
+    elseif h.role == Contradiction
+        R .= -h.η .* D
+    elseif h.role == Contrary
+        R .= -0.5f0 .* h.η .* D
+    end
+    S .- h.β .* D .+ h.γ .* Φpair .+ R
+end
+
+function (mha::SemioticMHA)(X::AbstractMatrix{T}, Φ::AbstractVector{T})
+    parts = Matrix{T}[]
+    for h in mha.heads
+        Q, K, V = h.WQ * X, h.WK * X, h.WV * X
+        A = role_bias(h, Q, K, Φ, mha.neg)
+        P = NNlib.softmax(A; dims=2)
+        push!(parts, V * P')
+    end
+    mha.WO * reduce(vcat, parts)
+end
+
+struct ArchetypeUnit
+    tag::UInt8
+    ds::Int
+    neg::Negation
+    df::DifferenceField
+    mf::MeaningField
+    mha::SemioticMHA
+    norm1::LayerNorm
+    chain::MeaningChainLayer
+    norm2::LayerNorm
+    sf::SelfField
+    F::Functor
+    morphs::Vector{Morphism}
+end
+@functor ArchetypeUnit
+
+function ArchetypeUnit(tag::UInt8, d::Int, ds::Int; k::Int=6, H::Int=3)
+    obj = Obj(ds)
+    morphs = [Morphism(obj, obj, Flux.glorot_uniform(ds, ds)) for _ in 1:3]
+    ArchetypeUnit(
+        tag,
+        ds,
+        Negation(ds),
+        DifferenceField(ds),
+        MeaningField(ds, k),
+        SemioticMHA(ds; H=H),
+        Flux.LayerNorm(ds),
+        MeaningChainLayer(ds),
+        Flux.LayerNorm(ds),
+        SelfField(ds),
+        Functor(Flux.glorot_uniform(d, ds), Flux.glorot_uniform(ds, d)),
+        morphs,
+    )
+end
+
+function (u::ArchetypeUnit)(Xg::AbstractMatrix{T}; will::Bool=true, update_field::Bool=false)
+    X = u.F.V * Xg
+    Φ = potential(u.mf, X)
+    Y = X .+ u.mha(u.norm1(X), Φ)
+    Z = Y .+ u.chain(u.norm2(Y), Φ)
+    if will
+        Gφ = similar(Z)
+        for j in 1:size(Z, 2)
+            Gφ[:, j] = potential_grad(u.mf, view(Z, :, j))
+        end
+        GD = zeros(T, size(Z, 1), size(Z, 2))
+        μ = mean(Z; dims=2)
+        @inbounds for j in 1:size(Z, 2)
+            GD[:, j] .= 2f0 .* (u.df.M * (size(Z, 2) .* view(Z, :, j) .- vec(μ)))
+        end
+        Z .+= 1e-2f0 .* Gφ .- 1e-3f0 .* GD
+    end
+    if update_field
+        update!(u.mf, Z)
+    end
+    u.F.U * Z
+end
+
+center_global(u::ArchetypeUnit) = u.F.U * u.sf.s
+
+struct ArchetypeRouter
+    gate::Dense
+    τ::T
+end
+@functor ArchetypeRouter
+
+ArchetypeRouter(d::Int, K::Int; τ=T(1.0)) = ArchetypeRouter(Dense(d, K), τ)
+
+route(ar::ArchetypeRouter, X::AbstractMatrix{T}) = NNlib.softmax(ar.gate(X) ./ ar.τ; dims=1)
+
+struct ArchetypalBlock
+    units::Vector{ArchetypeUnit}
+    router::ArchetypeRouter
+    df_global::DifferenceField
+    neg_global::Negation
+end
+@functor ArchetypalBlock
+
+function ArchetypalBlock(d::Int; K::Int=6, ds::Int=div(d, 2))
+    units = [ArchetypeUnit(UInt8(i), d, ds) for i in 1:K]
+    ArchetypalBlock(units, ArchetypeRouter(d, K), DifferenceField(d), Negation(d))
+end
+
+function (ab::ArchetypalBlock)(X::AbstractMatrix{T}; will::Bool=true, update_fields::Bool=false)
+    W = route(ab.router, X)
+    Y = zeros(T, size(X, 1), size(X, 2))
+    for (k, u) in enumerate(ab.units)
+        Yk = u(X; will=will, update_field=update_fields)
+        Y .+= Yk .* reshape(W[k, :], 1, :)
+    end
+    return Y, W
+end
+
+function archetype_rules_loss(ab::ArchetypalBlock; λ_self=T(1e-2), λ_pair=T(1e-2), margin=T(1.4))
+    K = length(ab.units)
+    c = [center_global(u) for u in ab.units]
+    if K < 3
+        return zero(T)
+    end
+    Lself = norm(c[1] .- coniunctio(ab.neg_global, c[2]; α=T(0.5)))^2
+    Lps = norm(c[3] .- (ab.neg_global.N * c[2]))^2
+    Lan = (K >= 5) ? norm(c[4] .- (ab.neg_global.N * c[5]))^2 : zero(T)
+    Lht = (K >= 6) ? NNlib.relu(margin .- norm(c[6] .- c[min(2, K)]))^2 : zero(T)
+    λ_self * Lself + λ_pair * (Lps + Lan + Lht)
+end
+
+function jnd_loss(df::DifferenceField, X::AbstractMatrix{T}; k=T(0.08), θ=T(0.05))
+    d, n = size(X)
+    L = zero(T)
+    for j in 1:n
+        x = view(X, :, j)
+        δ = k * max(norm(x), T(1.0)) .* randn(T, d) ./ sqrt(T(d))
+        xp = x .+ δ
+        Dloc = dot((x - xp), df.M * (x - xp)) |> df.φ
+        L += (Dloc - θ)^2
+    end
+    L / n
+end
+
+struct ArchetypalModel
+    emb::Embedding
+    block::ArchetypalBlock
+    ln::LayerNorm
+    proj::Dense
+end
+@functor ArchetypalModel
+
+function ArchetypalModel(vocab::Int, d::Int; K::Int=6, ds::Int=div(d, 2), classes::Int=vocab)
+    ArchetypalModel(Flux.Embedding(vocab, d), ArchetypalBlock(d; K=K, ds=ds), Flux.LayerNorm(d), Dense(d, classes))
+end
+
+function forward(m::ArchetypalModel, tokens::Vector{Int}; update_fields::Bool=false)
+    X = m.emb(tokens)
+    Y, W = m.block(X; will=true, update_fields=update_fields)
+    Y = m.ln(Y)
+    logits = m.proj(Y)
+    return logits, Y, W
+end
+
+function structure_penalty(ab::ArchetypalBlock)
+    L = zero(T)
+    for u in ab.units
+        if length(u.morphs) >= 2
+            f, g = u.morphs[1:2]
+            L += category_penalty(f, g, compose(g, f); λ_assoc=T(1e-3), λ_id=T(1e-3))
+            L += functor_penalty(u.F, f, g; λ=T(1e-3))
+        end
+        L += neg_penalty(u.mha; λ_inv=T(1e-3), λ_iso=T(1e-3), λ_sym=T(1e-4))
+    end
+    L += negation_penalty(ab.neg_global; λ_inv=T(5e-4), λ_iso=T(5e-4), λ_sym=T(1e-4))
+    L
+end
+
+function lossfn(m::ArchetypalModel, tokens::Vector{Int}, targets::Vector{Int}; λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3))
+    logits, Y, _ = forward(m, tokens; update_fields=false)
+    Lce = Flux.logitcrossentropy(logits, onehotbatch(targets, 1:size(logits, 1)))
+    Lstruct = structure_penalty(m.block)
+    Lrules = archetype_rules_loss(m.block)
+    Ljnd = jnd_loss(m.block.df_global, Y)
+    L = Lce + λ_struct * Lstruct + λ_rules * Lrules + λ_jnd * Ljnd
+    return L, (; Lce, Lstruct, Lrules, Ljnd)
+end
+
+function toy_train(; seed=2025)
+    Random.seed!(seed)
+    vocab = 12
+    d = 64
+    K = 6
+    ds = 32
+    m = ArchetypalModel(vocab, d; K=K, ds=ds)
+
+    tokens = [1, 2, 5, 6, 7, 3, 4, 2, 9, 10]
+    targets = [2, 1, 5, 6, 7, 4, 3, 1, 10, 9]
+
+    opt = Flux.setup(Flux.Optimisers.Adam(1e-3), m)
+
+    for step in 1:80
+        gs = Flux.gradient(Flux.params(m)) do
+            L, _ = lossfn(m, tokens, targets)
+            L
+        end
+        Flux.update!(opt, Flux.params(m), gs)
+        _ = forward(m, tokens; update_fields=true)
+
+        if step % 10 == 0
+            L, parts = lossfn(m, tokens, targets)
+            @info "step=$step" loss=L parts
+        end
+    end
+    m
+end
+
+end # module Archetypal
+
 end # module
