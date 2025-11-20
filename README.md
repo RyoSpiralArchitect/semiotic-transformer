@@ -2,8 +2,9 @@
 
 A compact Julia implementation of a "semiotic" Transformer that injects ideas from
 structural linguistics, semiotics, and depth psychology into an otherwise minimal
-Transformer block. The module is kept in a single file (`SemioticTransformer.jl`)
-so that it can be read like a Karpathy-style mini model while still exposing
+Transformer block. The module lives under `src/SemioticTransformer.jl` in a
+standard Julia package layout so it can still be read like a Karpathy-style
+mini model while exposing
 concepts such as Difference/Meaning fields, Greimas semiotic squares, and
 multi-path meaning recomposition.
 
@@ -33,16 +34,20 @@ multi-path meaning recomposition.
 
 ## Quick start
 
-Including `SemioticTransformer.jl` will, by default, activate, resolve, and
-instantiate the local project so dependencies like Flux/Functors/NNlib are
-present. If resolution/instantiation fails, the include now stops with a clear
-error instead of falling through to missing-package errors. You can skip this
-bootstrap by setting `SEMIOTIC_BOOTSTRAP=0` if you are already in an active
-environment. To make the dependency setup explicit (and refresh a stale
-`Manifest.toml`), resolve and instantiate first:
+With the code under `src/`, you can load the package directly after activating
+the project:
 
 ```julia
-julia --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate(); include("SemioticTransformer.jl"); using .SemioticTransformer'
+julia --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate(); using SemioticTransformer'
+```
+
+If you prefer the explicit bootstrap that activates and instantiates the
+project for you, the top-level `SemioticTransformer.jl` still performs that
+step before loading the module. You can opt out with
+`SEMIOTIC_BOOTSTRAP=0`:
+
+```julia
+julia --project=. -e 'include("SemioticTransformer.jl"); using .SemioticTransformer'
 ```
 
 Alternatively, run the helper script which activates the project, resolves, and
