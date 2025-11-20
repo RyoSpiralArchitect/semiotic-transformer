@@ -33,10 +33,12 @@ multi-path meaning recomposition.
 
 ## Quick start
 
-Including `SemioticTransformer.jl` will, by default, activate and instantiate the
-local project so dependencies like Flux/Functors/NNlib are present. You can skip
-this bootstrap by setting `SEMIOTIC_BOOTSTRAP=0` if you are already in an
-active environment. To make the dependency setup explicit (and refresh a stale
+Including `SemioticTransformer.jl` will, by default, activate, resolve, and
+instantiate the local project so dependencies like Flux/Functors/NNlib are
+present. If resolution/instantiation fails, the include now stops with a clear
+error instead of falling through to missing-package errors. You can skip this
+bootstrap by setting `SEMIOTIC_BOOTSTRAP=0` if you are already in an active
+environment. To make the dependency setup explicit (and refresh a stale
 `Manifest.toml`), resolve and instantiate first:
 
 ```julia

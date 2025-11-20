@@ -7,9 +7,12 @@ if get(ENV, "SEMIOTIC_BOOTSTRAP", "1") != "0"
     import Pkg
     try
         Pkg.activate(@__DIR__)
+        # Resolve first to repair any stale manifests before instantiating.
+        Pkg.resolve()
         Pkg.instantiate()
     catch err
-        @warn "SemioticTransformer bootstrap failed—dependencies may be missing" error=err
+        @error "SemioticTransformer bootstrap failed; run `Pkg.resolve(); Pkg.instantiate()` manually" error=err
+        rethrow(err)
     end
 end
 
