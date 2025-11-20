@@ -1,0 +1,18 @@
+name: Julia CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.12'
+      - name: Resolve and install dependencies
+        run: julia --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate()'
+      - name: Compile and load
+        run: julia --project=. -e 'using SemioticTransformer; println("Loaded OK")'
