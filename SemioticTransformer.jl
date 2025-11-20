@@ -1,3 +1,18 @@
+"""
+Bootstrap the local project so `include("SemioticTransformer.jl")` works even when the
+repository has not been activated yet. Set `SEMIOTIC_BOOTSTRAP=0` to skip automatic
+activation/instantiation (for example, inside an already-active environment).
+"""
+if get(ENV, "SEMIOTIC_BOOTSTRAP", "1") != "0"
+    import Pkg
+    try
+        Pkg.activate(@__DIR__)
+        Pkg.instantiate()
+    catch err
+        @warn "SemioticTransformer bootstrap failed—dependencies may be missing" error=err
+    end
+end
+
 module SemioticTransformer
 
 using Flux
@@ -707,10 +722,10 @@ end
 module Archetypal
 
 using Flux, LinearAlgebra, Random, NNlib, Functors
-using ..: T, Negation, negation_penalty, DifferenceField,
-    difference_matrix, MeaningField, potential, potential_grad, update!,
-    MeaningChainLayer, SelfField, coniunctio, _apply_layernorm, _apply_dense,
-    next_token_pairs, _ce_loss
+import ..SemioticTransformer
+using ..SemioticTransformer: T, Negation, negation_penalty, DifferenceField, difference_matrix,
+    MeaningField, potential, potential_grad, update!, MeaningChainLayer, SelfField, coniunctio,
+    _apply_layernorm, _apply_dense, next_token_pairs, _ce_loss
 
 struct Obj
     d::Int
@@ -901,7 +916,9 @@ function _unit_forward(u::ArchetypeUnit, Xg::AbstractArray{T,3}; will::Bool=true
     locals = Array{T}(undef, u.ds, size(Xg, 2), batches)
     globals = Array{T}(undef, size(u.F.U, 1), size(Xg, 2), batches)
     @inbounds @views for b in 1:batches
-        locals[:, :, b], globals[:, :, b] = _unit_forward(u, view(Xg, :, :, b); will=will, update_field=update_field)
+        loc, glob = _unit_forward(u, view(Xg, :, :, b); will=will, update_field=update_field)
+        locals[:, :, b] .= loc
+        globals[:, :, b] .= glob
     end
     return locals, globals
 end
