@@ -709,7 +709,8 @@ module Archetypal
 using Flux, LinearAlgebra, Random, NNlib, Functors
 using ..: T, Negation, negation_penalty, DifferenceField,
     difference_matrix, MeaningField, potential, potential_grad, update!,
-    MeaningChainLayer, SelfField, coniunctio
+    MeaningChainLayer, SelfField, coniunctio, _apply_layernorm, _apply_dense,
+    next_token_pairs, _ce_loss
 
 struct Obj
     d::Int
@@ -893,6 +894,15 @@ function (u::ArchetypeUnit)(Xg::AbstractMatrix{T}; will::Bool=true, update_field
     u.F.U * Z
 end
 
+function (u::ArchetypeUnit)(Xg::AbstractArray{T,3}; will::Bool=true, update_field::Bool=false)
+    batches = size(Xg, 3)
+    Y = Array{T}(undef, size(u.F.U, 1), size(Xg, 2), batches)
+    @inbounds @views for b in 1:batches
+        Y[:, :, b] = u(view(Xg, :, :, b); will=will, update_field=update_field)
+    end
+    return Y
+end
+
 center_global(u::ArchetypeUnit) = u.F.U * u.sf.s
 
 struct ArchetypeRouter
@@ -904,6 +914,16 @@ end
 ArchetypeRouter(d::Int, K::Int; τ=T(1.0)) = ArchetypeRouter(Dense(d, K), τ)
 
 route(ar::ArchetypeRouter, X::AbstractMatrix{T}) = NNlib.softmax(ar.gate(X) ./ ar.τ; dims=1)
+function route(ar::ArchetypeRouter, X::AbstractArray{T,3})
+    K = size(ar.gate.weight, 1)
+    n = size(X, 2)
+    batches = size(X, 3)
+    W = Array{T}(undef, K, n, batches)
+    @inbounds @views for b in 1:batches
+        W[:, :, b] = route(ar, view(X, :, :, b))
+    end
+    return W
+end
 
 struct ArchetypalBlock
     units::Vector{ArchetypeUnit}
@@ -924,6 +944,20 @@ function (ab::ArchetypalBlock)(X::AbstractMatrix{T}; will::Bool=true, update_fie
     for (k, u) in enumerate(ab.units)
         Yk = u(X; will=will, update_field=update_fields)
         Y .+= Yk .* reshape(W[k, :], 1, :)
+    end
+    return Y, W
+end
+
+function (ab::ArchetypalBlock)(X::AbstractArray{T,3}; will::Bool=true, update_fields::Bool=false)
+    _, n, batches = size(X)
+    W = Array{T}(undef, length(ab.units), n, batches)
+    Y = zeros(T, size(X)...)
+    @inbounds @views for b in 1:batches
+        W[:, :, b] = route(ab.router, view(X, :, :, b))
+        for (k, u) in enumerate(ab.units)
+            Yk = u(view(X, :, :, b); will=will, update_field=update_fields)
+            Y[:, :, b] .+= Yk .* reshape(W[k, :, b], 1, :)
+        end
     end
     return Y, W
 end
@@ -954,6 +988,15 @@ function jnd_loss(df::DifferenceField, X::AbstractMatrix{T}; k=T(0.08), θ=T(0.0
     L / n
 end
 
+function jnd_loss(df::DifferenceField, X::AbstractArray{T,3}; k=T(0.08), θ=T(0.05))
+    batches = size(X, 3)
+    acc = zero(T)
+    @inbounds @views for b in 1:batches
+        acc += jnd_loss(df, view(X, :, :, b); k=k, θ=θ)
+    end
+    return acc / batches
+end
+
 struct ArchetypalModel
     emb::Embedding
     block::ArchetypalBlock
@@ -966,11 +1009,19 @@ function ArchetypalModel(vocab::Int, d::Int; K::Int=6, ds::Int=div(d, 2), classe
     ArchetypalModel(Flux.Embedding(vocab, d), ArchetypalBlock(d; K=K, ds=ds), Flux.LayerNorm(d), Dense(d, classes))
 end
 
-function forward(m::ArchetypalModel, tokens::Vector{Int}; update_fields::Bool=false)
+function forward(m::ArchetypalModel, tokens::AbstractVector{<:Integer}; update_fields::Bool=false, will::Bool=true)
     X = m.emb(tokens)
-    Y, W = m.block(X; will=true, update_fields=update_fields)
-    Y = m.ln(Y)
+    Y, W = m.block(X; will=will, update_fields=update_fields)
+    Y = _apply_layernorm(m.ln, Y)
     logits = m.proj(Y)
+    return logits, Y, W
+end
+
+function forward(m::ArchetypalModel, tokens::AbstractMatrix{<:Integer}; update_fields::Bool=false, will::Bool=true)
+    X = m.emb(tokens)
+    Y, W = m.block(X; will=will, update_fields=update_fields)
+    Y = _apply_layernorm(m.ln, Y)
+    logits = _apply_dense(m.proj, Y)
     return logits, Y, W
 end
 
@@ -988,9 +1039,37 @@ function structure_penalty(ab::ArchetypalBlock)
     L
 end
 
-function lossfn(m::ArchetypalModel, tokens::Vector{Int}, targets::Vector{Int}; λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3))
-    logits, Y, _ = forward(m, tokens; update_fields=false)
-    Lce = Flux.logitcrossentropy(logits, onehotbatch(targets, 1:size(logits, 1)))
+function lossfn(m::ArchetypalModel, tokens::AbstractVector{<:Integer}; pad_token::Union{Nothing,Int}=nothing,
+        λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3), update_fields::Bool=false, will::Bool=true)
+    context, targets = next_token_pairs(tokens)
+    return lossfn(m, context, targets; pad_token=pad_token, λ_struct=λ_struct, λ_rules=λ_rules, λ_jnd=λ_jnd,
+        update_fields=update_fields, will=will)
+end
+
+function lossfn(m::ArchetypalModel, tokens::AbstractMatrix{<:Integer}; pad_token::Union{Nothing,Int}=nothing,
+        λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3), update_fields::Bool=false, will::Bool=true)
+    context, targets = next_token_pairs(tokens)
+    return lossfn(m, context, targets; pad_token=pad_token, λ_struct=λ_struct, λ_rules=λ_rules, λ_jnd=λ_jnd,
+        update_fields=update_fields, will=will)
+end
+
+function lossfn(m::ArchetypalModel, tokens::AbstractVector{<:Integer}, targets::AbstractVector{<:Integer};
+        pad_token::Union{Nothing,Int}=nothing, λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3),
+        update_fields::Bool=false, will::Bool=true)
+    logits, Y, _ = forward(m, tokens; update_fields=update_fields, will=will)
+    Lce = _ce_loss(logits, targets; pad_token=pad_token)
+    Lstruct = structure_penalty(m.block)
+    Lrules = archetype_rules_loss(m.block)
+    Ljnd = jnd_loss(m.block.df_global, Y)
+    L = Lce + λ_struct * Lstruct + λ_rules * Lrules + λ_jnd * Ljnd
+    return L, (; Lce, Lstruct, Lrules, Ljnd)
+end
+
+function lossfn(m::ArchetypalModel, tokens::AbstractMatrix{<:Integer}, targets::AbstractMatrix{<:Integer};
+        pad_token::Union{Nothing,Int}=nothing, λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3),
+        update_fields::Bool=false, will::Bool=true)
+    logits, Y, _ = forward(m, tokens; update_fields=update_fields, will=will)
+    Lce = _ce_loss(logits, targets; pad_token=pad_token)
     Lstruct = structure_penalty(m.block)
     Lrules = archetype_rules_loss(m.block)
     Ljnd = jnd_loss(m.block.df_global, Y)

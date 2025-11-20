@@ -149,6 +149,16 @@ julia> include("SemioticTransformer.jl"); using .SemioticTransformer.Archetypal
 julia> m = Archetypal.toy_train()
 ```
 
+The archetypal helpers mirror the main API: `lossfn(model, sequence)` shifts
+tokens internally, works with column-stacked batches, accepts `pad_token` to
+mask padded targets, and lets you toggle field updates or will-flow via
+`update_fields` / `will` keywords. For example:
+
+```julia
+seqs = hcat([1, 2, 5, 6], [2, 3, 0, 0])
+loss, parts = Archetypal.lossfn(m, seqs; pad_token=0, λ_rules=1e-2, λ_struct=1e-3)
+```
+
 You can tweak the archetypal geometry by adjusting the rule weight
 (`λ_rules`), the category/functor weight (`λ_struct`), or the router temperature
 (`τ`) inside `ArchetypeRouter` for harder or softer routing.
