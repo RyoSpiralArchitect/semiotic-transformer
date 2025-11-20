@@ -40,6 +40,13 @@ indices and enables the Negation operator. The helper `lossfn(model, sequence)` 
 shift the sequence internally (tokens `1:n-1` predict `2:n`), add the summed square
 loss across all registered squares, and apply the negation regulariser.
 
+If your sequences contain padding, pass the pad token through to ignore those
+positions during the cross-entropy term:
+
+```julia
+loss = SemioticTransformer.lossfn(model, sequence; pad_token=0)
+```
+
 If you want manual control over the training pairs you can call the more explicit
 method:
 
@@ -58,6 +65,15 @@ returns logits shaped `classes × sequence_length × batch`.
 ```julia
 sequences = hcat([1, 2, 5, 6], [2, 3, 4, 1])
 loss = SemioticTransformer.lossfn(model, sequences; λ_square=0.05f0)
+```
+
+When columns have padding (e.g. ragged sentences packed together), supply
+`pad_token` so the masked positions are dropped from the cross-entropy term while
+still flowing through the semiotic penalties:
+
+```julia
+sequences = hcat([1, 2, 5, 6], [2, 3, 0, 0])
+loss = SemioticTransformer.lossfn(model, sequences; pad_token=0)
 ```
 
 To supervise more than one semiotic relation simultaneously, pass a collection of

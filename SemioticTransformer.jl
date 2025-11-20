@@ -404,27 +404,43 @@ function next_token_pairs(tokens::AbstractMatrix{<:Integer})
     return tokens[1:end-1, :], tokens[2:end, :]
 end
 
-_ce_loss(logits::AbstractMatrix{T}, targets::AbstractVector{<:Integer}) where {T} =
-    Flux.logitcrossentropy(logits, onehotbatch(targets, 1:size(logits, 1)))
+function _ce_loss(logits::AbstractMatrix{T}, targets::AbstractVector{<:Integer}; pad_token::Union{Nothing,Int}=nothing) where {T}
+    classes = size(logits, 1)
+    if pad_token === nothing
+        return Flux.logitcrossentropy(logits, onehotbatch(targets, 1:classes))
+    end
+    keep = findall(!=(pad_token), targets)
+    isempty(keep) && return zero(T)
+    return Flux.logitcrossentropy(logits[:, keep], onehotbatch(view(targets, keep), 1:classes))
+end
 
-function _ce_loss(logits::AbstractArray{T,3}, targets::AbstractMatrix{<:Integer}) where {T}
+function _ce_loss(logits::AbstractArray{T,3}, targets::AbstractMatrix{<:Integer}; pad_token::Union{Nothing,Int}=nothing) where {T}
     classes = size(logits, 1)
     cols = size(logits, 2) * size(logits, 3)
     flat_logits = reshape(logits, classes, cols)
-    return Flux.logitcrossentropy(flat_logits, onehotbatch(vec(targets), 1:classes))
+    flat_targets = vec(targets)
+    if pad_token !== nothing
+        mask = flat_targets .!= pad_token
+        if !any(mask)
+            return zero(T)
+        end
+        flat_logits = view(flat_logits, :, mask)
+        flat_targets = view(flat_targets, mask)
+    end
+    return Flux.logitcrossentropy(flat_logits, onehotbatch(flat_targets, 1:classes))
 end
 
-function lossfn(m::SemioticModel, tokens::AbstractVector{<:Integer}, targets::AbstractVector{<:Integer}; λ_square = T(0.1), λ_neg=T(0.05))
+function lossfn(m::SemioticModel, tokens::AbstractVector{<:Integer}, targets::AbstractVector{<:Integer}; λ_square = T(0.1), λ_neg=T(0.05), pad_token::Union{Nothing,Int}=nothing)
     logits = m(tokens)
-    Lce = _ce_loss(logits, targets)
+    Lce = _ce_loss(logits, targets; pad_token=pad_token)
     Lsq = square_penalty(m.emb.weight, m.squares)
     Lneg = negation_penalty(m.neg, m.emb.weight, m.squares)
     return Lce + λ_square * Lsq + λ_neg * Lneg
 end
 
-function lossfn(m::SemioticModel, tokens::AbstractMatrix{<:Integer}, targets::AbstractMatrix{<:Integer}; λ_square = T(0.1), λ_neg=T(0.05))
+function lossfn(m::SemioticModel, tokens::AbstractMatrix{<:Integer}, targets::AbstractMatrix{<:Integer}; λ_square = T(0.1), λ_neg=T(0.05), pad_token::Union{Nothing,Int}=nothing)
     logits = m(tokens)
-    Lce = _ce_loss(logits, targets)
+    Lce = _ce_loss(logits, targets; pad_token=pad_token)
     Lsq = square_penalty(m.emb.weight, m.squares)
     Lneg = negation_penalty(m.neg, m.emb.weight, m.squares)
     return Lce + λ_square * Lsq + λ_neg * Lneg
