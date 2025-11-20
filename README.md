@@ -138,6 +138,11 @@ Key ideas:
   coniunctio/negation relations and margin constraints.
 * **Router** – `ArchetypeRouter` outputs soft assignments per token so the
   block behaves like a Mixture-of-Experts over archetypal subcategories.
+* **Scene monoid (⊙)** – `SceneMonoid` projects each archetype’s local codes
+  into a scene space `r`, mixes pairwise Hadamard products with router weights,
+  and lifts the composed scene back to the global space. `λ_mono` controls the
+  (soft) unit/associativity regulariser, while `λ_pair` scales the scene add-on
+  in the block constructor.
 * **JND + Negation regularisers** – the global DifferenceField receives the
   same Weber-style `jnd_loss`, while local and global Negation operators are
   kept involutive/isometric via `negation_penalty`.
@@ -156,10 +161,11 @@ mask padded targets, and lets you toggle field updates or will-flow via
 
 ```julia
 seqs = hcat([1, 2, 5, 6], [2, 3, 0, 0])
-loss, parts = Archetypal.lossfn(m, seqs; pad_token=0, λ_rules=1e-2, λ_struct=1e-3)
+loss, parts = Archetypal.lossfn(m, seqs; pad_token=0, λ_rules=1e-2, λ_struct=1e-3, λ_mono=1e-3)
 ```
 
 You can tweak the archetypal geometry by adjusting the rule weight
-(`λ_rules`), the category/functor weight (`λ_struct`), or the router temperature
-(`τ`) inside `ArchetypeRouter` for harder or softer routing.
+(`λ_rules`), the category/functor weight (`λ_struct`), the monoid penalty
+(`λ_mono`), the scene scale (`λ_pair`) and dimensionality (`r`), or the router
+temperature (`τ`) inside `ArchetypeRouter` for harder or softer routing.
 

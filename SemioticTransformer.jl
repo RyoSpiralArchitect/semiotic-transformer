@@ -871,7 +871,8 @@ function ArchetypeUnit(tag::UInt8, d::Int, ds::Int; k::Int=6, H::Int=3)
     )
 end
 
-function (u::ArchetypeUnit)(Xg::AbstractMatrix{T}; will::Bool=true, update_field::Bool=false)
+"""Return local codes and global projection for a single sequence."""
+function _unit_forward(u::ArchetypeUnit, Xg::AbstractMatrix{T}; will::Bool=true, update_field::Bool=false)
     X = u.F.V * Xg
     Φ = potential(u.mf, X)
     Y = X .+ u.mha(u.norm1(X), Φ)
@@ -891,15 +892,27 @@ function (u::ArchetypeUnit)(Xg::AbstractMatrix{T}; will::Bool=true, update_field
     if update_field
         update!(u.mf, Z)
     end
-    u.F.U * Z
+    return Z, u.F.U * Z
+end
+
+"""Return local codes and global projection for batched sequences (d×n×b)."""
+function _unit_forward(u::ArchetypeUnit, Xg::AbstractArray{T,3}; will::Bool=true, update_field::Bool=false)
+    batches = size(Xg, 3)
+    locals = Array{T}(undef, u.ds, size(Xg, 2), batches)
+    globals = Array{T}(undef, size(u.F.U, 1), size(Xg, 2), batches)
+    @inbounds @views for b in 1:batches
+        locals[:, :, b], globals[:, :, b] = _unit_forward(u, view(Xg, :, :, b); will=will, update_field=update_field)
+    end
+    return locals, globals
+end
+
+function (u::ArchetypeUnit)(Xg::AbstractMatrix{T}; will::Bool=true, update_field::Bool=false)
+    _, Y = _unit_forward(u, Xg; will=will, update_field=update_field)
+    return Y
 end
 
 function (u::ArchetypeUnit)(Xg::AbstractArray{T,3}; will::Bool=true, update_field::Bool=false)
-    batches = size(Xg, 3)
-    Y = Array{T}(undef, size(u.F.U, 1), size(Xg, 2), batches)
-    @inbounds @views for b in 1:batches
-        Y[:, :, b] = u(view(Xg, :, :, b); will=will, update_field=update_field)
-    end
+    _, Y = _unit_forward(u, Xg; will=will, update_field=update_field)
     return Y
 end
 
@@ -925,41 +938,151 @@ function route(ar::ArchetypeRouter, X::AbstractArray{T,3})
     return W
 end
 
+"""Scene monoid for pairwise archetype composition (Hadamard)."""
+struct SceneMonoid
+    U::Matrix{T}            # d×r
+    P::Vector{Matrix{T}}    # K×(r×ds) projections
+    e::Vector{T}            # unit element (≈1)
+    λ_pair::T
+end
+@functor SceneMonoid
+
+function SceneMonoid(d::Int, ds::Int, K::Int, r::Int; λ_pair=T(0.5))
+    SceneMonoid(Flux.glorot_uniform(d, r), [Flux.glorot_uniform(r, ds) for _ in 1:K], ones(T, r), λ_pair)
+end
+
+"""Compose pairwise scene interactions for a single sequence."""
+function scene_compose(sm::SceneMonoid, locals::Vector{<:AbstractMatrix{T}}, W::AbstractMatrix{T})
+    K = length(locals)
+    rdim = size(sm.U, 2)
+    n = size(W, 2)
+    R = [sm.P[k] * locals[k] for k in 1:K]  # r×n projections
+    rsum = zeros(T, rdim, n)
+    @inbounds for i in 1:n
+        wi = view(W, :, i)
+        for a in 1:K-1, b in (a + 1):K
+            wpair = wi[a] * wi[b]
+            if wpair > 0
+                rsum[:, i] .+= wpair .* (view(R[a], :, i) .* view(R[b], :, i))
+            end
+        end
+    end
+    sm.λ_pair .* (sm.U * rsum)
+end
+
+"""Compose pairwise scene interactions for batched sequences."""
+function scene_compose(sm::SceneMonoid, locals::Vector{<:AbstractArray{T,3}}, W::AbstractArray{T,3})
+    K = length(locals)
+    rdim = size(sm.U, 2)
+    n = size(W, 2)
+    batches = size(W, 3)
+    Y = zeros(T, size(sm.U, 1), n, batches)
+    @inbounds @views for b in 1:batches
+        R = [sm.P[k] * view(locals[k], :, :, b) for k in 1:K]
+        rsum = zeros(T, rdim, n)
+        for i in 1:n
+            wi = view(W, :, i, b)
+            for a in 1:K-1, c in (a + 1):K
+                wpair = wi[a] * wi[c]
+                if wpair > 0
+                    rsum[:, i] .+= wpair .* (view(R[a], :, i) .* view(R[c], :, i))
+                end
+            end
+        end
+        Y[:, :, b] .= sm.λ_pair .* (sm.U * rsum)
+    end
+    Y
+end
+
+function monoid_penalty(sm::SceneMonoid, locals::Vector{<:AbstractMatrix{T}}; λ_unit=T(1e-3), λ_assoc=T(1e-3), samples::Int=4)
+    K = length(locals)
+    n = size(locals[1], 2)
+    rdim = size(sm.U, 2)
+    sample_ids = 1:min(samples, n)
+    L_unit = zero(T)
+    for t in sample_ids, u in 1:K
+        r = sm.P[u] * view(locals[u], :, t:t)
+        L_unit += mean((r .* sm.e .- r).^2)
+    end
+    L_assoc = zero(T)
+    if K >= 3
+        for t in sample_ids
+            ra = sm.P[1] * view(locals[1], :, t:t)
+            rb = sm.P[2] * view(locals[2], :, t:t)
+            rc = sm.P[3] * view(locals[3], :, t:t)
+            L_assoc += mean(((ra .* rb) .* rc .- (ra .* (rb .* rc))).^2)
+        end
+    end
+    λ_unit * L_unit + λ_assoc * L_assoc
+end
+
+function monoid_penalty(sm::SceneMonoid, locals::Vector{<:AbstractArray{T,3}}; λ_unit=T(1e-3), λ_assoc=T(1e-3), samples::Int=4)
+    K = length(locals)
+    n = size(locals[1], 2)
+    batches = size(locals[1], 3)
+    sample_ids = 1:min(samples, n)
+    L_unit = zero(T)
+    for b in 1:batches
+        for t in sample_ids, u in 1:K
+            r = sm.P[u] * view(locals[u], :, t:t, b)
+            L_unit += mean((r .* sm.e .- r).^2)
+        end
+    end
+    L_assoc = zero(T)
+    if K >= 3
+        for b in 1:batches, t in sample_ids
+            ra = sm.P[1] * view(locals[1], :, t:t, b)
+            rb = sm.P[2] * view(locals[2], :, t:t, b)
+            rc = sm.P[3] * view(locals[3], :, t:t, b)
+            L_assoc += mean(((ra .* rb) .* rc .- (ra .* (rb .* rc))).^2)
+        end
+    end
+    λ_unit * L_unit + λ_assoc * L_assoc
+end
+
 struct ArchetypalBlock
     units::Vector{ArchetypeUnit}
     router::ArchetypeRouter
+    monoid::SceneMonoid
     df_global::DifferenceField
     neg_global::Negation
 end
 @functor ArchetypalBlock
 
-function ArchetypalBlock(d::Int; K::Int=6, ds::Int=div(d, 2))
+function ArchetypalBlock(d::Int; K::Int=6, ds::Int=div(d, 2), r::Int=32, λ_pair::T=0.5f0)
     units = [ArchetypeUnit(UInt8(i), d, ds) for i in 1:K]
-    ArchetypalBlock(units, ArchetypeRouter(d, K), DifferenceField(d), Negation(d))
+    ArchetypalBlock(units, ArchetypeRouter(d, K), SceneMonoid(d, ds, K, r; λ_pair=λ_pair), DifferenceField(d), Negation(d))
 end
 
 function (ab::ArchetypalBlock)(X::AbstractMatrix{T}; will::Bool=true, update_fields::Bool=false)
     W = route(ab.router, X)
     Y = zeros(T, size(X, 1), size(X, 2))
+    locals = Vector{Matrix{T}}(undef, length(ab.units))
     for (k, u) in enumerate(ab.units)
-        Yk = u(X; will=will, update_field=update_fields)
+        locals[k], Yk = _unit_forward(u, X; will=will, update_field=update_fields)
         Y .+= Yk .* reshape(W[k, :], 1, :)
     end
-    return Y, W
+    scene = scene_compose(ab.monoid, locals, W)
+    return Y .+ scene, W, (; locals)
 end
 
 function (ab::ArchetypalBlock)(X::AbstractArray{T,3}; will::Bool=true, update_fields::Bool=false)
     _, n, batches = size(X)
-    W = Array{T}(undef, length(ab.units), n, batches)
+    K = length(ab.units)
+    W = Array{T}(undef, K, n, batches)
     Y = zeros(T, size(X)...)
+    locals = Vector{Array{T,3}}(undef, K)
     @inbounds @views for b in 1:batches
         W[:, :, b] = route(ab.router, view(X, :, :, b))
-        for (k, u) in enumerate(ab.units)
-            Yk = u(view(X, :, :, b); will=will, update_field=update_fields)
-            Y[:, :, b] .+= Yk .* reshape(W[k, :, b], 1, :)
+    end
+    for (k, u) in enumerate(ab.units)
+        locals[k], Yk = _unit_forward(u, X; will=will, update_field=update_fields)
+        @inbounds @views for b in 1:batches
+            Y[:, :, b] .+= view(Yk, :, :, b) .* reshape(W[k, :, b], 1, :)
         end
     end
-    return Y, W
+    scene = scene_compose(ab.monoid, locals, W)
+    return Y .+ scene, W, (; locals)
 end
 
 function archetype_rules_loss(ab::ArchetypalBlock; λ_self=T(1e-2), λ_pair=T(1e-2), margin=T(1.4))
@@ -1005,24 +1128,24 @@ struct ArchetypalModel
 end
 @functor ArchetypalModel
 
-function ArchetypalModel(vocab::Int, d::Int; K::Int=6, ds::Int=div(d, 2), classes::Int=vocab)
-    ArchetypalModel(Flux.Embedding(vocab, d), ArchetypalBlock(d; K=K, ds=ds), Flux.LayerNorm(d), Dense(d, classes))
+function ArchetypalModel(vocab::Int, d::Int; K::Int=6, ds::Int=div(d, 2), r::Int=32, λ_pair::T=0.5f0, classes::Int=vocab)
+    ArchetypalModel(Flux.Embedding(vocab, d), ArchetypalBlock(d; K=K, ds=ds, r=r, λ_pair=λ_pair), Flux.LayerNorm(d), Dense(d, classes))
 end
 
 function forward(m::ArchetypalModel, tokens::AbstractVector{<:Integer}; update_fields::Bool=false, will::Bool=true)
     X = m.emb(tokens)
-    Y, W = m.block(X; will=will, update_fields=update_fields)
+    Y, W, cache = m.block(X; will=will, update_fields=update_fields)
     Y = _apply_layernorm(m.ln, Y)
     logits = m.proj(Y)
-    return logits, Y, W
+    return logits, Y, W, cache
 end
 
 function forward(m::ArchetypalModel, tokens::AbstractMatrix{<:Integer}; update_fields::Bool=false, will::Bool=true)
     X = m.emb(tokens)
-    Y, W = m.block(X; will=will, update_fields=update_fields)
+    Y, W, cache = m.block(X; will=will, update_fields=update_fields)
     Y = _apply_layernorm(m.ln, Y)
     logits = _apply_dense(m.proj, Y)
-    return logits, Y, W
+    return logits, Y, W, cache
 end
 
 function structure_penalty(ab::ArchetypalBlock)
@@ -1040,41 +1163,43 @@ function structure_penalty(ab::ArchetypalBlock)
 end
 
 function lossfn(m::ArchetypalModel, tokens::AbstractVector{<:Integer}; pad_token::Union{Nothing,Int}=nothing,
-        λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3), update_fields::Bool=false, will::Bool=true)
+        λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3), λ_mono=T(1e-3), update_fields::Bool=false, will::Bool=true)
     context, targets = next_token_pairs(tokens)
     return lossfn(m, context, targets; pad_token=pad_token, λ_struct=λ_struct, λ_rules=λ_rules, λ_jnd=λ_jnd,
-        update_fields=update_fields, will=will)
+        λ_mono=λ_mono, update_fields=update_fields, will=will)
 end
 
 function lossfn(m::ArchetypalModel, tokens::AbstractMatrix{<:Integer}; pad_token::Union{Nothing,Int}=nothing,
-        λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3), update_fields::Bool=false, will::Bool=true)
+        λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3), λ_mono=T(1e-3), update_fields::Bool=false, will::Bool=true)
     context, targets = next_token_pairs(tokens)
     return lossfn(m, context, targets; pad_token=pad_token, λ_struct=λ_struct, λ_rules=λ_rules, λ_jnd=λ_jnd,
-        update_fields=update_fields, will=will)
+        λ_mono=λ_mono, update_fields=update_fields, will=will)
 end
 
 function lossfn(m::ArchetypalModel, tokens::AbstractVector{<:Integer}, targets::AbstractVector{<:Integer};
-        pad_token::Union{Nothing,Int}=nothing, λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3),
+        pad_token::Union{Nothing,Int}=nothing, λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3), λ_mono=T(1e-3),
         update_fields::Bool=false, will::Bool=true)
-    logits, Y, _ = forward(m, tokens; update_fields=update_fields, will=will)
+    logits, Y, _, cache = forward(m, tokens; update_fields=update_fields, will=will)
     Lce = _ce_loss(logits, targets; pad_token=pad_token)
     Lstruct = structure_penalty(m.block)
     Lrules = archetype_rules_loss(m.block)
     Ljnd = jnd_loss(m.block.df_global, Y)
-    L = Lce + λ_struct * Lstruct + λ_rules * Lrules + λ_jnd * Ljnd
-    return L, (; Lce, Lstruct, Lrules, Ljnd)
+    Lmono = monoid_penalty(m.block.monoid, cache.locals)
+    L = Lce + λ_struct * Lstruct + λ_rules * Lrules + λ_jnd * Ljnd + λ_mono * Lmono
+    return L, (; Lce, Lstruct, Lrules, Ljnd, Lmono)
 end
 
 function lossfn(m::ArchetypalModel, tokens::AbstractMatrix{<:Integer}, targets::AbstractMatrix{<:Integer};
-        pad_token::Union{Nothing,Int}=nothing, λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3),
+        pad_token::Union{Nothing,Int}=nothing, λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3), λ_mono=T(1e-3),
         update_fields::Bool=false, will::Bool=true)
-    logits, Y, _ = forward(m, tokens; update_fields=update_fields, will=will)
+    logits, Y, _, cache = forward(m, tokens; update_fields=update_fields, will=will)
     Lce = _ce_loss(logits, targets; pad_token=pad_token)
     Lstruct = structure_penalty(m.block)
     Lrules = archetype_rules_loss(m.block)
     Ljnd = jnd_loss(m.block.df_global, Y)
-    L = Lce + λ_struct * Lstruct + λ_rules * Lrules + λ_jnd * Ljnd
-    return L, (; Lce, Lstruct, Lrules, Ljnd)
+    Lmono = monoid_penalty(m.block.monoid, cache.locals)
+    L = Lce + λ_struct * Lstruct + λ_rules * Lrules + λ_jnd * Ljnd + λ_mono * Lmono
+    return L, (; Lce, Lstruct, Lrules, Ljnd, Lmono)
 end
 
 function toy_train(; seed=2025)
@@ -1083,7 +1208,8 @@ function toy_train(; seed=2025)
     d = 64
     K = 6
     ds = 32
-    m = ArchetypalModel(vocab, d; K=K, ds=ds)
+    r = 32
+    m = ArchetypalModel(vocab, d; K=K, ds=ds, r=r)
 
     tokens = [1, 2, 5, 6, 7, 3, 4, 2, 9, 10]
     targets = [2, 1, 5, 6, 7, 4, 3, 1, 10, 9]
@@ -1096,7 +1222,7 @@ function toy_train(; seed=2025)
             L
         end
         Flux.update!(opt, Flux.params(m), gs)
-        _ = forward(m, tokens; update_fields=true)
+        forward(m, tokens; update_fields=true)
 
         if step % 10 == 0
             L, parts = lossfn(m, tokens, targets)
