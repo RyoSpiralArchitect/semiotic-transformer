@@ -588,6 +588,63 @@ function forward(m::SemioticModel, tokens::AbstractMatrix{<:Integer}; update_fie
     return logits, total_KL, recL, X
 end
 
+_normalize!(v::AbstractVector{T}) where {T} = begin
+    nrm = norm(v)
+    if nrm > eps(T)
+        v ./= nrm
+    end
+    v
+end
+
+function _pooled_embedding(X::AbstractMatrix{T}, tokens::AbstractVector{<:Integer};
+        pooling::Symbol=:mean, pad_token::Union{Nothing,Int}=nothing, normalize::Bool=true) where {T}
+    pooling in (:mean, :last) || error("Unsupported pooling option: $pooling")
+    cols = pad_token === nothing ? collect(1:size(X, 2)) : findall(!=(pad_token), tokens)
+    isempty(cols) && return zeros(T, size(X, 1))
+    pooled = pooling === :last ? copy(view(X, :, cols[end])) : vec(mean(view(X, :, cols), dims=2))
+    normalize ? _normalize!(pooled) : pooled
+end
+
+function _pooled_embedding(X::AbstractArray{T,3}, tokens::AbstractMatrix{<:Integer};
+        pooling::Symbol=:mean, pad_token::Union{Nothing,Int}=nothing, normalize::Bool=true) where {T}
+    pooling in (:mean, :last) || error("Unsupported pooling option: $pooling")
+    d, _, batches = size(X)
+    out = zeros(T, d, batches)
+    @inbounds @views for b in 1:batches
+        cols = pad_token === nothing ? collect(1:size(X, 2)) : findall(!=(pad_token), view(tokens, :, b))
+        if isempty(cols)
+            continue
+        end
+        pooled = pooling === :last ? copy(view(X, :, cols[end], b)) : vec(mean(view(X, :, cols, b), dims=2))
+        if normalize
+            _normalize!(pooled)
+        end
+        out[:, b] .= pooled
+    end
+    out
+end
+
+"""
+    embed_tokens(model, tokens; pooling=:mean, pad_token=nothing, normalize=true, update_field=false, will=false)
+
+Return L2-normalised sequence embeddings from the final hidden states. `pooling` can be
+`:mean` (default) or `:last`. When `pad_token` is provided, padded positions are
+excluded from the pooling step.
+"""
+function embed_tokens(m::SemioticModel, tokens::AbstractVector{<:Integer};
+        pooling::Symbol=:mean, pad_token::Union{Nothing,Int}=nothing, normalize::Bool=true,
+        update_field::Bool=false, will::Bool=false)
+    _, _, _, X = forward(m, tokens; update_field=update_field, will=will)
+    _pooled_embedding(X, tokens; pooling=pooling, pad_token=pad_token, normalize=normalize)
+end
+
+function embed_tokens(m::SemioticModel, tokens::AbstractMatrix{<:Integer};
+        pooling::Symbol=:mean, pad_token::Union{Nothing,Int}=nothing, normalize::Bool=true,
+        update_field::Bool=false, will::Bool=false)
+    _, _, _, X = forward(m, tokens; update_field=update_field, will=will)
+    _pooled_embedding(X, tokens; pooling=pooling, pad_token=pad_token, normalize=normalize)
+end
+
 _apply_dense(layer::Dense, X::AbstractMatrix{T}) where {T} = layer(X)
 function _apply_dense(layer::Dense, X::AbstractArray{T,3}) where {T}
     d, n, batches = size(X)
@@ -1185,6 +1242,20 @@ function forward(m::ArchetypalModel, tokens::AbstractMatrix{<:Integer}; update_f
     Y = _apply_layernorm(m.ln, Y)
     logits = _apply_dense(m.proj, Y)
     return logits, Y, W, cache
+end
+
+function embed_tokens(m::ArchetypalModel, tokens::AbstractVector{<:Integer};
+        pooling::Symbol=:mean, pad_token::Union{Nothing,Int}=nothing, normalize::Bool=true,
+        update_fields::Bool=false, will::Bool=false)
+    _, Y, _, _ = forward(m, tokens; update_fields=update_fields, will=will)
+    _pooled_embedding(Y, tokens; pooling=pooling, pad_token=pad_token, normalize=normalize)
+end
+
+function embed_tokens(m::ArchetypalModel, tokens::AbstractMatrix{<:Integer};
+        pooling::Symbol=:mean, pad_token::Union{Nothing,Int}=nothing, normalize::Bool=true,
+        update_fields::Bool=false, will::Bool=false)
+    _, Y, _, _ = forward(m, tokens; update_fields=update_fields, will=will)
+    _pooled_embedding(Y, tokens; pooling=pooling, pad_token=pad_token, normalize=normalize)
 end
 
 function structure_penalty(ab::ArchetypalBlock)

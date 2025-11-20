@@ -194,6 +194,43 @@ pairs = [(1, 3), (2, 4), (1, 6)]  # Self×Shadow, Persona×Anima, Self×Trickste
 m = Archetypal.ArchetypalModel(vocab, d; allowed_pairs=pairs, r=48)
 ```
 
+### RAG-ready embeddings (after syncing checkpoints)
+
+Both the main model and the archetypal variant expose `embed_tokens` to pool the
+final hidden states into an L2-normalised sequence embedding (mean or last
+token). This makes it easy to generate vectors for downstream retrieval or RAG
+pipelines, including checkpoints synced from EC2 or other hosts.
+
+1. Resolve/instantiate the project locally (see quick start) and load your
+   weights (for example a `BSON` checkpoint synced from EC2):
+
+   ```julia
+   using Flux, BSON, SemioticTransformer
+
+   model = SemioticTransformer.SemioticModel(vocab, d; layers=2)
+   Flux.loadparams!(model, BSON.load("checkpoint.bson")[:model])
+   ```
+
+2. Produce embeddings for one or more tokenised sequences. Padding tokens are
+   ignored during pooling when `pad_token` is supplied; choose `pooling=:mean`
+   (default) or `:last`:
+
+   ```julia
+   seq = [1, 2, 5, 6, 0, 0]  # padded example
+   emb = SemioticTransformer.embed_tokens(model, seq; pad_token=0)
+
+   batch = hcat([1, 2, 5, 6], [2, 3, 0, 0])
+   batch_emb = SemioticTransformer.embed_tokens(model, batch; pad_token=0, pooling=:last)
+   ```
+
+For the archetypal variant use the same helper:
+
+```julia
+using SemioticTransformer.Archetypal
+m = Archetypal.ArchetypalModel(vocab, d)
+emb = Archetypal.embed_tokens(m, seq; pad_token=0)
+```
+
 ## CI quick check
 
 A minimal GitHub Actions workflow (`.github/workflows/ci.yml`) is provided to
