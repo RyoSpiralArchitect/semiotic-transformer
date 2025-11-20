@@ -304,6 +304,20 @@ function will_step!(X::AbstractArray{T,3}, mf::MeaningField, df::DifferenceField
     return X
 end
 
+"X: d×n×b, Φ: n×b → Y: d×n×b"
+function (m::MeaningChainLayer)(X::AbstractArray{T,3}, Φ::AbstractMatrix{T})
+    d, n, batches = size(X)
+    cols = n * batches
+    Xflat = reshape(X, d, cols)
+    Φrow = reshape(vec(Φ), 1, cols)
+    d0 = m.den(Xflat)
+    c0 = m.con(Xflat) .* (1 .+ Φrow)
+    y0 = m.myth(c0)
+    α = NNlib.softmax(m.α)
+    out = α[1] .* d0 .+ α[2] .* c0 .+ α[3] .* y0
+    return reshape(out, d, n, batches)
+end
+
 # -----------------------------
 # D) Fechner/Weber: JND constraint
 # -----------------------------
