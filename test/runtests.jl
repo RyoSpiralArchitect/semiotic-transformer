@@ -18,4 +18,11 @@ using SemioticTransformer
     loss, parts = SemioticTransformer.lossfn(model, tokens)
     @test isfinite(loss)
     @test all(isfinite, values(parts))
+
+    instab = SemioticTransformer.meaning_instability(model.blocks[end].mf, acts; ε=1f-3, samples=2)
+    @test instab >= 0
+
+    loss2, parts2 = SemioticTransformer.lossfn(model, tokens; λ_instab=1f-2, instab_samples=2)
+    @test isfinite(loss2)
+    @test isfinite(parts2.Linstab)
 end

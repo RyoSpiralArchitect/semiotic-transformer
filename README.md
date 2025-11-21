@@ -161,6 +161,43 @@ model = SemioticModel(vocab, d; squares=squares)
   small perturbations are neither collapsed nor exaggerated by the difference
   metric.
 
+## Extra-semiotic meaning: instability of the meaning field
+
+“Meaning outside meaning” shows up as a change in interpretation without any
+symbolic change. In this model that maps to **how sensitive the meaning field’s
+gradient is to tiny, non-symbolic perturbations**. We can instrument that
+directly:
+
+* The helper `meaning_instability(mf, X; ε, samples)` measures how much the
+  meaning gradient `∇Φ` jumps when every token embedding is nudged by noise
+  `ε·N(0, I)`. Formally,
+
+  ```
+  Δ∇Φ = ∇Φ(x + ε) - ∇Φ(x)
+  L_extra = mean‖Δ∇Φ‖²
+  ```
+
+* Wire this into the loss as a “meaning-instability penalty” to encourage
+  robustness to non-symbolic jolts while keeping symbolic structure intact:
+
+  ```julia
+  loss, parts = SemioticTransformer.lossfn(model, tokens;
+      λ_instab=1f-2, ε_instab=1f-3, instab_samples=4)
+  @info parts.Linstab  # ≈ extra-semiotic volatility
+  ```
+
+* For manual probes, pull the top block’s meaning field and state activations
+  from `forward` and call the helper directly:
+
+  ```julia
+  logits, KL, recL, acts = SemioticTransformer.forward(model, tokens)
+  L_extra = SemioticTransformer.meaning_instability(model.blocks[end].mf, acts;
+      ε=5f-4, samples=8)
+  ```
+
+The penalty is zero by default; enable it when you want to monitor or suppress
+extra-semiotic drift induced by silence, timing, or other non-symbolic cues.
+
 ## Archetypal subcategories (V4) inside `SemioticTransformer`
 
 The archetypal "V4" variant now lives directly inside `SemioticTransformer`
