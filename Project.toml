@@ -9,7 +9,7 @@ NNlib = "872c559c-99b0-510c-b3b7-b6c96a88d5cd"
 Functors = "d9f16b24-f501-4c13-a1f2-28368ffc5196"
 
 [compat]
-julia = "1.9"
-Flux = "^0.16"
+julia = "1.6, 1.7, 1.8, 1.9, 1.10, 1.12"
+Flux = "0.14, 0.15, 0.16"
+Functors = "0.4, 0.5"
 NNlib = "^0.9"
-Functors = "^0.4"
