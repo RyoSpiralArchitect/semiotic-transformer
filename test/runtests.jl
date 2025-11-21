@@ -122,7 +122,14 @@ end
     L_base, _ = SemioticTransformer.Archetypal.base_loss(model, tokens, targets)
     @test isfinite(L_base)
 
-    _, dev_state = SemioticTransformer.Archetypal.train_with_time(; seed=9, steps=5, λ_time=1f-2)
+    _, dev_state, trace = SemioticTransformer.Archetypal.train_with_time(; seed=9, steps=5, λ_time=1f-2, trace=true)
     @test 0f0 <= dev_state.m <= 1f0
     @test 0f0 <= dev_state.s <= 1f0
+    @test length(trace) == 5
+
+    table = SemioticTransformer.Archetypal.devstate_trace_table(trace)
+    @test occursin("step,L_total", table)
+    tmptrace = tempname()
+    SemioticTransformer.Archetypal.save_devstate_trace(tmptrace, trace)
+    @test isfile(tmptrace)
 end

@@ -1481,6 +1481,37 @@ end
         return L_total, (parts=parts_struct, flow=flow, L_struct=L_struct, L_time=L_time)
     end
 
+    function devstate_trace_row(step::Integer, L_total, info, dev::DevState)
+        return (
+            step=Int(step),
+            L_total=L_total,
+            L_struct=info.L_struct,
+            L_time=info.L_time,
+            m=dev.m,
+            s=dev.s,
+            H_start=info.flow.H_start,
+            H_end=info.flow.H_end,
+            H_mean=info.flow.H_mean,
+            conflict=info.flow.conflict,
+        )
+    end
+
+    function devstate_trace_table(trace)
+        io = IOBuffer()
+        println(io, "step,L_total,L_struct,L_time,m,s,H_start,H_end,H_mean,conflict")
+        for row in trace
+            println(io, "$(row.step),$(row.L_total),$(row.L_struct),$(row.L_time),$(row.m),$(row.s),$(row.H_start),$(row.H_end),$(row.H_mean),$(row.conflict)")
+        end
+        return String(take!(io))
+    end
+
+    function save_devstate_trace(path::AbstractString, trace)
+        open(path, "w") do io
+            println(io, devstate_trace_table(trace))
+        end
+        return path
+    end
+
     function toy_train(; seed=2025)
         Random.seed!(seed)
         vocab = 12
@@ -1511,7 +1542,7 @@ end
     m
     end
 
-    function train_with_time(; seed=2025, steps=200, λ_time=T(1e-2))
+    function train_with_time(; seed=2025, steps=200, λ_time=T(1e-2), trace::Bool=false, save_trace::Union{Nothing,String}=nothing)
         Random.seed!(seed)
         vocab = 12
         d = 64
@@ -1525,6 +1556,7 @@ end
 
         opt = Flux.setup(Flux.Optimisers.Adam(1e-3), m)
         dev = DevState()
+        logs = trace ? Any[] : nothing
 
         for step in 1:steps
             _ = Float32(step / steps)
@@ -1538,9 +1570,18 @@ end
             Ltot, info = total_loss(m, tokens, targets, dev; λ_time=λ_time)
             update!(dev, info.parts; flow=info.flow)
 
+            if trace
+                push!(logs, devstate_trace_row(step, Ltot, info, dev))
+            end
+
             if step % 20 == 0
                 @info "step=$step" L=Ltot dev=dev flow=info.flow parts=info.parts
             end
+        end
+
+        if trace
+            save_trace === nothing || save_devstate_trace(save_trace, logs)
+            return m, dev, logs
         end
 
         return m, dev

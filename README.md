@@ -354,6 +354,21 @@ extra-semiotic drift induced by silence, timing, or other non-symbolic cues.
   m, dev = SemioticTransformer.Archetypal.train_with_time(; steps=120, λ_time=1e-2)
   ```
 
+* **Export the developmental trace.** Enable `trace=true` to capture per-step
+  maturity/stress, temporal losses, and entropy/conflict metrics. Persist the
+  CSV directly from the helper or via the dedicated script:
+
+  ```julia
+  m, dev, log = SemioticTransformer.Archetypal.train_with_time(
+      ; steps=64, λ_time=5f-3, trace=true, save_trace="dev_trace.csv")
+  first(log), last(log) # per-step snapshots
+  ```
+
+  ```bash
+  SEMIOTIC_TIME_STEPS=80 SEMIOTIC_TIME_LAMBDA=5e-3 SEMIOTIC_DEV_TRACE=dev_trace.csv \
+  scripts/temporal_train.jl
+  ```
+
 ## Archetypal subcategories (V4) inside `SemioticTransformer`
 
 The archetypal "V4" variant now lives directly inside `SemioticTransformer`
