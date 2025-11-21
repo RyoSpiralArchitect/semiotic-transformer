@@ -1,21 +1,21 @@
 name = "SemioticTransformer"
 uuid = "0b70ca6e-b118-4a76-bdfe-df6c6714c5c2"
-authors = ["Ryo ∴ SpiralArchitect <kishkavsesvit@icloud.com>"]
 version = "0.1.0"
+authors = ["Ryo ∴ SpiralArchitect <kishkavsesvit@icloud.com>"]
 
 [deps]
 Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
-NNlib = "872c559c-99b0-510c-b3b7-b6c96a88d5cd"
 Functors = "d9f16b24-f501-4c13-a1f2-28368ffc5196"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
-Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
-SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+NNlib = "872c559c-99b0-510c-b3b7-b6c96a88d5cd"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
-Random = "9a3f8284-79ce-11e8-123f-4567abcd8901"
-
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 
 [compat]
-julia = "1.6, 1.7, 1.8, 1.9, 1.10, 1.12"
 Flux = "0.14, 0.15, 0.16"
 Functors = "0.4, 0.5"
 NNlib = "^0.9"
+Random = "1.11.0"
+julia = "1.6, 1.7, 1.8, 1.9, 1.10, 1.12"
