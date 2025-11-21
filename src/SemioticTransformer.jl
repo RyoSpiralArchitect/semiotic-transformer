@@ -1495,19 +1495,44 @@ function cognitive_probe(; vocab::Int=16, d::Int=24, seq::Int=8, seed::Int=0,
         global_K::Int=3, global_ds::Int=12, global_r::Int=16, global_λ_pair::T=0.5f0,
         λ_square::T=T(0.05), λ_neg::T=T(1e-3), λ_KL::T=T(1e-3), λ_rec::T=T(1e-2),
         λ_self::T=T(1e-2), λ_jnd::T=T(1e-3), λ_instab::T=T(0f0), ε_instab::T=T(1e-3), instab_samples::Int=1,
-        λ_struct::T=T(1e-3), λ_rules::T=T(1e-2), λ_mono::T=T(1e-3), λ_global::T=T(1f0), λ_couple::T=T(1e-3))
+        λ_struct::T=T(1e-3), λ_rules::T=T(1e-2), λ_mono::T=T(1e-3), λ_global::T=T(1f0), λ_couple::T=T(1e-3),
+        epsilons::AbstractVector{T}=T[1f-4, 5f-4, 1f-3, 5f-3], profile_width::Int=28,
+        save_profile::Union{Nothing,AbstractString}=nothing, visualize::Bool=true)
     seed >= 0 && Random.seed!(seed)
     tokens = rand(1:vocab, seq)
     emb = Flux.Embedding(vocab, d)
     cog = CognitiveModel(emb; classes=vocab, local_layers=local_layers, local_H=local_H, local_k=local_k, local_z=local_z,
         global_K=global_K, global_ds=global_ds, global_r=global_r, global_λ_pair=global_λ_pair)
 
+    # Grab ψ snapshot from a forward pass for diagnostics before computing losses
+    forward_out = forward(cog, tokens; update_fields=true)
+    psi = forward_out.psi
+    mf = cog.local.blocks[end].mf
+    df = cog.local.blocks[end].df
+
+    instab = meaning_instability(mf, psi.X; ε=ε_instab, samples=instab_samples)
+    sweep = meaning_instability_profile(mf, psi.X; epsilons=epsilons, samples=instab_samples)
+    spark = instability_sparkline(sweep; width=profile_width)
+    isnothing(save_profile) || save_instability_profile(save_profile, sweep)
+
+    potentials = potential(mf, psi.X)
+    grad_norms = [norm(potential_grad(mf, view(psi.X, :, j))) for j in 1:size(psi.X, 2)]
+    heatmaps = (
+        potential = ascii_heatmap(reshape(potentials, 1, :)),
+        difference = ascii_heatmap(df isa DifferenceField ? difference_matrix(df, psi.X) : psi.diff),
+        grad_norms = ascii_heatmap(reshape(grad_norms, 1, :)),
+    )
+
     L, parts = lossfn(cog, tokens; λ_square=λ_square, λ_neg=λ_neg, λ_KL=λ_KL, λ_rec=λ_rec, λ_self=λ_self,
         λ_jnd=λ_jnd, λ_instab=λ_instab, ε_instab=ε_instab, instab_samples=instab_samples,
         λ_struct=λ_struct, λ_rules=λ_rules, λ_mono=λ_mono, λ_global=λ_global, λ_couple=λ_couple)
 
+    if visualize
+        @info "cognitive bridge probe" L_total=L Lcouple=parts.Lcouple instab sweep spark heatmaps
+    end
+
     return (; Ltotal=L, tokens, psi=parts.psi, Lcouple=parts.Lcouple,
-            local=parts.local, global=parts.global)
+            local=parts.local, global=parts.global, instab, sweep, spark, heatmaps)
 end
 
 end # module
