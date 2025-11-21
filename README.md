@@ -52,7 +52,14 @@ multi-path meaning recomposition.
    You should see logging as the archetypal toy loop trains for a few dozen
    steps.
 
-3. Import and call the same demo from the REPL or a script:
+3. Run the same demo via a helper script that activates the project, honours an
+   optional `SEMIOTIC_SEED`, and gives you a single command to copy/paste:
+
+   ```bash
+   SEMIOTIC_SEED=42 julia scripts/toy_train.jl
+   ```
+
+4. Import and call the same demo from the REPL or a script:
 
    ```julia
    julia --project=. -e 'using SemioticTransformer; SemioticTransformer.toy_train()'
@@ -72,6 +79,13 @@ installs dependencies before returning control to the REPL:
 ```bash
 julia scripts/instantiate.jl
 julia --project=. -e 'include("SemioticTransformer.jl"); using .SemioticTransformer'
+```
+
+For a quick health check, a lightweight test now exercises the embedding,
+forward pass, and loss helpers on a tiny synthetic batch:
+
+```bash
+julia --project=. -e 'using Pkg; Pkg.test()'
 ```
 
 By default the toy example wires a SemioticSquare over the first four vocabulary
