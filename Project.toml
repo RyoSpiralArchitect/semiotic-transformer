@@ -1,5 +1,6 @@
 name = "SemioticTransformer"
 uuid = "0b70ca6e-b118-4a76-bdfe-df6c6714c5c2"
+authors = ["Ryo ∴ SpiralArchitect <kishkavsesvit@icloud.com>"]
 version = "0.1.0"
 
 [deps]
@@ -9,6 +10,6 @@ Functors = "d9f16b24-f501-4c13-a1f2-28368ffc5196"
 
 [compat]
 julia = "1.9"
-Flux = "0.14-0.16"
-NNlib = "0.9"
-Functors = "0.4"
+Flux = "^0.14"
+NNlib = "^0.9"
+Functors = "^0.4"
