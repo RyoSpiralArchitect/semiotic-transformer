@@ -65,6 +65,24 @@ multi-path meaning recomposition.
    julia --project=. -e 'using SemioticTransformer; SemioticTransformer.toy_train()'
    ```
 
+5. Probe and visualise the extra-semiotic “meaning instability” metric directly. A helper
+   script activates the project, wires in sensible defaults, and surfaces knobs
+   via environment variables (sweep + ASCII heatmaps for potentials, difference
+   field, and ‖∇Φ‖ per token):
+
+   ```bash
+   SEMIOTIC_EPS=5e-4 SEMIOTIC_SAMPLES=4 SEMIOTIC_LAMBDA_INSTAB=1e-2 julia scripts/instability_probe.jl
+   SEMIOTIC_EPS=1e-3 julia scripts/instability_viz.jl
+   ```
+
+   You can call the same probe function from the REPL and inspect the returned
+   metrics and activations:
+
+   ```julia
+   julia --project=. -e 'using SemioticTransformer; SemioticTransformer.instability_probe()'
+   julia --project=. -e 'using SemioticTransformer; SemioticTransformer.instability_probe(; epsilons=[1f-4,5f-4,1f-3], visualize=false)'
+   ```
+
 If you prefer the explicit bootstrap that activates and instantiates the
 project for you, the top-level `SemioticTransformer.jl` still performs that
 step before loading the module. You can opt out with `SEMIOTIC_BOOTSTRAP=0`:
@@ -197,6 +215,22 @@ directly:
 
 The penalty is zero by default; enable it when you want to monitor or suppress
 extra-semiotic drift induced by silence, timing, or other non-symbolic cues.
+
+* Explore volatility across noise scales with `meaning_instability_profile`,
+  which returns a sweep of `(ε, instability)` tuples that can be plotted or
+  inspected from the REPL:
+
+  ```julia
+  logits, KL, recL, acts = SemioticTransformer.forward(model, tokens)
+  sweep = SemioticTransformer.meaning_instability_profile(model.blocks[end].mf, acts;
+      epsilons=[1f-4, 5f-4, 1f-3, 5f-3], samples=4)
+  ```
+
+* Visualise the field without external plotting packages. `instability_probe`
+  now emits tiny ASCII heatmaps for the meaning potentials, the
+  DifferenceField map, and the gradient norms `‖∇Φ‖` per token. The helper
+  `ascii_heatmap` is available if you want to render your own matrices the same
+  way.
 
 ## Archetypal subcategories (V4) inside `SemioticTransformer`
 

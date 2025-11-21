@@ -140,6 +140,10 @@ function meaning_instability(mf::MeaningField, X::AbstractArray{T,3}; ε::T=T(1e
     return accum / (samples * n * batches)
 end
 
+function meaning_instability_profile(mf::MeaningField, X; epsilons::AbstractVector{T}=T[1f-4, 5f-4, 1f-3, 5f-3], samples::Int=4)
+    return [(ϵ, meaning_instability(mf, X; ε=ϵ, samples=samples)) for ϵ in epsilons]
+end
+
 function update!(mf::MeaningField, X::AbstractMatrix{T}; τ=T(0.95), temp=T(1.0))
     d, n = size(X)
     k = size(mf.P, 2)
@@ -706,6 +710,24 @@ end
 # -----------------------------
 # Toy usage
 # -----------------------------
+_heat_levels() = collect(" ▁▂▃▄▅▆▇█")
+
+function ascii_heatmap(M::AbstractMatrix{<:Real}; levels=_heat_levels())
+    isempty(M) && return ""
+    lo, hi = extrema(M)
+    span = hi - lo
+    chars = IOBuffer()
+    nlevels = length(levels)
+    for i in 1:size(M, 1)
+        for j in 1:size(M, 2)
+            idx = span == 0 ? nlevels : clamp(Int(floor((M[i, j] - lo) / span * (nlevels - 1))) + 1, 1, nlevels)
+            print(chars, levels[idx])
+        end
+        i < size(M, 1) && print(chars, '\n')
+    end
+    return String(take!(chars))
+end
+
 function toy_train(; seed=7)
     Random.seed!(seed)
     vocab = 8; d = 64
@@ -725,10 +747,48 @@ function toy_train(; seed=7)
         _ = forward(m, tokens; update_field=true, will=true)
         if step % 10 == 0
             L, parts = lossfn(m, tokens, targets; λ_square=0.05f0, λ_neg=0.01f0)
-            @info "step=$step" loss=L parts
+            instab = meaning_instability(m.blocks[end].mf, X; ε=5f-4, samples=4)
+            @info "step=$step" loss=L instab parts
         end
     end
     return m
+end
+
+function instability_probe(; seed=2027, ε=5f-4, samples::Int=4, λ_instab=T(1f-2), epsilons::AbstractVector{T}=T[1f-4, 5f-4, 1f-3, 5f-3], visualize::Bool=true)
+    Random.seed!(seed)
+    vocab = 8; d = 64
+    sq = SemioticSquare(1, 2, 3, 4)
+    m = SemioticModel(vocab, d; layers=2, H=3, k=8, z=32, square=sq)
+
+    tokens  = [1, 2, 5, 6, 7, 3, 4, 2]
+    targets = [2, 1, 5, 6, 7, 4, 3, 1]
+
+    logits, KL, recL, acts = forward(m, tokens; update_field=true, will=true)
+    mf = m.blocks[end].mf
+    df = m.blocks[end].df
+
+    instab = meaning_instability(mf, acts; ε=ε, samples=samples)
+    sweep = meaning_instability_profile(mf, acts; epsilons=epsilons, samples=samples)
+
+    loss, parts = lossfn(m, tokens, targets;
+        λ_square=0.05f0, λ_neg=0.01f0, λ_instab=λ_instab,
+        ε_instab=ε, instab_samples=samples)
+
+    potentials = potential(mf, acts)
+    diffmap = difference_matrix(df, acts)
+    grad_norms = [norm(potential_grad(mf, view(acts, :, j))) for j in 1:size(acts, 2)]
+
+    heatmaps = (
+        potential = ascii_heatmap(reshape(potentials, 1, :)),
+        difference = ascii_heatmap(diffmap),
+        grad_norms = ascii_heatmap(reshape(grad_norms, 1, :))
+    )
+
+    if visualize
+        @info "meaning-instability probe" instab sweep loss parts heatmaps
+    end
+
+    return (; instab, loss, parts, logits, KL, recL, sweep, potentials, diffmap, grad_norms, heatmaps)
 end
 
 # =============================
