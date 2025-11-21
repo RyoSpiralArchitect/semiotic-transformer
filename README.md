@@ -34,17 +34,33 @@ multi-path meaning recomposition.
 
 ## Quick start
 
-With the code under `src/`, you can load the package directly after activating
-the project (compatible with Flux `0.14` through `0.16`):
+1. Clone and activate the project (Flux `0.14`–`0.16` are supported):
 
-```julia
-julia --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate(); using SemioticTransformer'
-```
+   ```bash
+   git clone https://github.com/you/semiotic-transformer.git
+   cd semiotic-transformer
+   julia --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate()'
+   ```
+
+2. See something run immediately. The module file now self-hosts a tiny demo, so
+   you can execute it directly:
+
+   ```bash
+   julia --project=. src/SemioticTransformer.jl
+   ```
+
+   You should see logging as the archetypal toy loop trains for a few dozen
+   steps.
+
+3. Import and call the same demo from the REPL or a script:
+
+   ```julia
+   julia --project=. -e 'using SemioticTransformer; SemioticTransformer.toy_train()'
+   ```
 
 If you prefer the explicit bootstrap that activates and instantiates the
 project for you, the top-level `SemioticTransformer.jl` still performs that
-step before loading the module. You can opt out with
-`SEMIOTIC_BOOTSTRAP=0`:
+step before loading the module. You can opt out with `SEMIOTIC_BOOTSTRAP=0`:
 
 ```julia
 julia --project=. -e 'include("SemioticTransformer.jl"); using .SemioticTransformer'
@@ -56,12 +72,6 @@ installs dependencies before returning control to the REPL:
 ```bash
 julia scripts/instantiate.jl
 julia --project=. -e 'include("SemioticTransformer.jl"); using .SemioticTransformer'
-```
-
-You can then run the toy optimiser step:
-
-```julia
-julia> SemioticTransformer.toy_train()
 ```
 
 By default the toy example wires a SemioticSquare over the first four vocabulary
