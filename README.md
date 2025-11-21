@@ -277,6 +277,27 @@ extra-semiotic drift induced by silence, timing, or other non-symbolic cues.
   meaning prototypes sit to archetypal centers, letting you tune how tightly the
   local flow should align with the global mythic structure.
 
+* **Probe the bridge end-to-end.** Use `cognitive_probe` for a single-shot
+  diagnostic that seeds the RNG, samples a token sequence, and reports the
+  coupled loss decomposition plus a ψ snapshot:
+
+  ```julia
+  probe = SemioticTransformer.cognitive_probe(; vocab=24, d=32, seq=12,
+      λ_global=0.5f0, λ_couple=1f-2, λ_instab=1f-3, instab_samples=4)
+  probe.Ltotal   # combined ψ + archetype + coupling loss
+  probe.local    # instability, jnd, negation, etc.
+  probe.global   # structural, rules, monoid parts
+  probe.psi.Φ    # meaning potentials for the sampled sequence
+  ```
+
+  A ready-made script is available too:
+
+  ```bash
+  SEMIOTIC_SEED=7 SEMIOTIC_VOCAB=20 SEMIOTIC_D=32 \
+    SEMIOTIC_LAMBDA_COUPLE=1e-2 SEMIOTIC_LAMBDA_INSTAB=1e-3 \
+    scripts/cognitive_probe.jl
+  ```
+
 ## Archetypal subcategories (V4) inside `SemioticTransformer`
 
 The archetypal "V4" variant now lives directly inside `SemioticTransformer`

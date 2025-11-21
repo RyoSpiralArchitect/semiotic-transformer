@@ -73,4 +73,12 @@ end
 
     cpen = SemioticTransformer.coupling_penalty(cog.local, cog.global)
     @test cpen >= 0
+
+    probe = SemioticTransformer.cognitive_probe(; vocab=vocab, d=d, seq=6, seed=7,
+        λ_global=0.25f0, λ_couple=5f-3, λ_instab=1f-3, instab_samples=2)
+    @test isfinite(probe.Ltotal)
+    @test probe.Lcouple >= 0
+    @test isfinite(probe.local.Lce)
+    @test isfinite(probe.global.Lce)
+    @test probe.psi isa SemioticTransformer.PsiState
 end

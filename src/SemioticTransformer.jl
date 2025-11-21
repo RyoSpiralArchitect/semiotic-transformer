@@ -1490,6 +1490,26 @@ function lossfn(m::CognitiveModel, tokens, targets; pad_token::Union{Nothing,Int
     return L, (; local=parts_local, global=parts_global, Lcouple, psi=psi_state(m.local, acts_local))
 end
 
+function cognitive_probe(; vocab::Int=16, d::Int=24, seq::Int=8, seed::Int=0,
+        local_layers::Int=1, local_H::Int=3, local_k::Int=4, local_z::Int=12,
+        global_K::Int=3, global_ds::Int=12, global_r::Int=16, global_λ_pair::T=0.5f0,
+        λ_square::T=T(0.05), λ_neg::T=T(1e-3), λ_KL::T=T(1e-3), λ_rec::T=T(1e-2),
+        λ_self::T=T(1e-2), λ_jnd::T=T(1e-3), λ_instab::T=T(0f0), ε_instab::T=T(1e-3), instab_samples::Int=1,
+        λ_struct::T=T(1e-3), λ_rules::T=T(1e-2), λ_mono::T=T(1e-3), λ_global::T=T(1f0), λ_couple::T=T(1e-3))
+    seed >= 0 && Random.seed!(seed)
+    tokens = rand(1:vocab, seq)
+    emb = Flux.Embedding(vocab, d)
+    cog = CognitiveModel(emb; classes=vocab, local_layers=local_layers, local_H=local_H, local_k=local_k, local_z=local_z,
+        global_K=global_K, global_ds=global_ds, global_r=global_r, global_λ_pair=global_λ_pair)
+
+    L, parts = lossfn(cog, tokens; λ_square=λ_square, λ_neg=λ_neg, λ_KL=λ_KL, λ_rec=λ_rec, λ_self=λ_self,
+        λ_jnd=λ_jnd, λ_instab=λ_instab, ε_instab=ε_instab, instab_samples=instab_samples,
+        λ_struct=λ_struct, λ_rules=λ_rules, λ_mono=λ_mono, λ_global=λ_global, λ_couple=λ_couple)
+
+    return (; Ltotal=L, tokens, psi=parts.psi, Lcouple=parts.Lcouple,
+            local=parts.local, global=parts.global)
+end
+
 end # module
 
 if abspath(PROGRAM_FILE) == @__FILE__
