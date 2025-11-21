@@ -1443,6 +1443,52 @@ function coupling_penalty(local::SemioticModel, global::Archetypal.ArchetypalMod
     return acc / K
 end
 
+function coupling_matrix(local::SemioticModel, global::Archetypal.ArchetypalModel)
+    P = local.blocks[end].mf.P
+    centers = [center_global(u) for u in global.block.units]
+    ncenters = length(centers)
+    nproto = size(P, 2)
+    (ncenters == 0 || nproto == 0) && return zeros(T, ncenters, nproto)
+    M = zeros(T, ncenters, nproto)
+    @inbounds for i in 1:ncenters
+        ci = centers[i]
+        for j in 1:nproto
+            M[i, j] = norm(view(P, :, j) .- ci)
+        end
+    end
+    return M
+end
+
+function coupling_profile(local::SemioticModel, global::Archetypal.ArchetypalModel)
+    M = coupling_matrix(local, global)
+    proto_min = size(M, 2) == 0 ? T[] : vec(mapslices(minimum, M; dims=1))
+    center_min = size(M, 1) == 0 ? T[] : vec(mapslices(minimum, M; dims=2))
+    return (; matrix=M, proto_min, center_min)
+end
+
+function coupling_sparkline(distances; width::Int=28)
+    profile = [(T(i), d) for (i, d) in enumerate(distances)]
+    return instability_sparkline(profile; width=width)
+end
+
+function save_coupling_matrix(path::AbstractString, M)
+    open(path, "w") do io
+        print(io, "center/proto")
+        for j in 1:size(M, 2)
+            print(io, ",p$j")
+        end
+        println(io)
+        for i in 1:size(M, 1)
+            print(io, "c$i")
+            for j in 1:size(M, 2)
+                print(io, ",", M[i, j])
+            end
+            println(io)
+        end
+    end
+    return path
+end
+
 function forward(m::CognitiveModel, X; update_fields::Bool=false, will_local::Bool=true, will_global::Bool=true)
     local_logits, KL, recL, acts_local = forward(m.local, X; update_field=update_fields, will=will_local)
     global_logits, codes, W, cache_global = forward(m.global, X; update_fields=update_fields, will=will_global)
@@ -1497,7 +1543,8 @@ function cognitive_probe(; vocab::Int=16, d::Int=24, seq::Int=8, seed::Int=0,
         λ_self::T=T(1e-2), λ_jnd::T=T(1e-3), λ_instab::T=T(0f0), ε_instab::T=T(1e-3), instab_samples::Int=1,
         λ_struct::T=T(1e-3), λ_rules::T=T(1e-2), λ_mono::T=T(1e-3), λ_global::T=T(1f0), λ_couple::T=T(1e-3),
         epsilons::AbstractVector{T}=T[1f-4, 5f-4, 1f-3, 5f-3], profile_width::Int=28,
-        save_profile::Union{Nothing,AbstractString}=nothing, visualize::Bool=true)
+        save_profile::Union{Nothing,AbstractString}=nothing, save_coupling::Union{Nothing,AbstractString}=nothing,
+        visualize::Bool=true)
     seed >= 0 && Random.seed!(seed)
     tokens = rand(1:vocab, seq)
     emb = Flux.Embedding(vocab, d)
@@ -1515,12 +1562,23 @@ function cognitive_probe(; vocab::Int=16, d::Int=24, seq::Int=8, seed::Int=0,
     spark = instability_sparkline(sweep; width=profile_width)
     isnothing(save_profile) || save_instability_profile(save_profile, sweep)
 
+    coupling = coupling_profile(cog.local, cog.global)
+    coupling_spark = coupling_sparkline(coupling.proto_min; width=profile_width)
+    coupling_heat = ascii_heatmap(coupling.matrix)
+    coupling_path = save_coupling
+    if save_profile isa AbstractString
+        base = splitext(save_profile)
+        coupling_path = isnothing(coupling_path) ? base[1] * "_coupling" * base[2] : coupling_path
+    end
+    coupling_path isa AbstractString && save_coupling_matrix(coupling_path, coupling.matrix)
+
     potentials = potential(mf, psi.X)
     grad_norms = [norm(potential_grad(mf, view(psi.X, :, j))) for j in 1:size(psi.X, 2)]
     heatmaps = (
         potential = ascii_heatmap(reshape(potentials, 1, :)),
         difference = ascii_heatmap(df isa DifferenceField ? difference_matrix(df, psi.X) : psi.diff),
         grad_norms = ascii_heatmap(reshape(grad_norms, 1, :)),
+        coupling = coupling_heat,
     )
 
     L, parts = lossfn(cog, tokens; λ_square=λ_square, λ_neg=λ_neg, λ_KL=λ_KL, λ_rec=λ_rec, λ_self=λ_self,
@@ -1528,11 +1586,12 @@ function cognitive_probe(; vocab::Int=16, d::Int=24, seq::Int=8, seed::Int=0,
         λ_struct=λ_struct, λ_rules=λ_rules, λ_mono=λ_mono, λ_global=λ_global, λ_couple=λ_couple)
 
     if visualize
-        @info "cognitive bridge probe" L_total=L Lcouple=parts.Lcouple instab sweep spark heatmaps
+        @info "cognitive bridge probe" L_total=L Lcouple=parts.Lcouple instab sweep spark coupling_spark coupling_heat coupling_path heatmaps
     end
 
     return (; Ltotal=L, tokens, psi=parts.psi, Lcouple=parts.Lcouple,
-            local=parts.local, global=parts.global, instab, sweep, spark, heatmaps)
+            local=parts.local, global=parts.global, instab, sweep, spark,
+            coupling=(; coupling..., spark=coupling_spark, path=coupling_path), heatmaps)
 end
 
 end # module

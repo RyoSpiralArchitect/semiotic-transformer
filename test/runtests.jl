@@ -85,4 +85,9 @@ end
     @test !isempty(probe.spark)
     @test !isempty(probe.sweep)
     @test !isempty(probe.heatmaps.potential)
+    @test !isempty(probe.coupling.spark)
+    @test size(probe.coupling.matrix) == (global_K, local_k)
+    @test length(probe.coupling.proto_min) == local_k
+    @test length(probe.coupling.center_min) == global_K
+    @test !isempty(probe.heatmaps.coupling)
 end

@@ -280,7 +280,10 @@ extra-semiotic drift induced by silence, timing, or other non-symbolic cues.
 * **Probe the bridge end-to-end.** Use `cognitive_probe` for a single-shot
   diagnostic that seeds the RNG, samples a token sequence, and reports the
   coupled loss decomposition plus a ψ snapshot and instability sweep (sparkline
-  + heatmaps) drawn from the shared embedding:
+  + heatmaps) drawn from the shared embedding. It now also emits a coupling
+  distance matrix between ψ prototypes and archetypal centers, alongside a
+  sparkline of the per-prototype minima and an ASCII heatmap for a quick visual
+  on alignment:
 
   ```julia
   probe = SemioticTransformer.cognitive_probe(; vocab=24, d=32, seq=12,
@@ -292,17 +295,18 @@ extra-semiotic drift induced by silence, timing, or other non-symbolic cues.
   probe.global   # structural, rules, monoid parts
   probe.psi.Φ    # meaning potentials for the sampled sequence
   probe.spark    # normalized instability sparkline
-  probe.heatmaps # potential / difference / grad_norm ASCII blocks
+  probe.coupling # distance matrix, proto/center minima, sparkline, csv path
+  probe.heatmaps # potential / difference / grad_norm / coupling ASCII blocks
   ```
 
   A ready-made script is available too:
 
   ```bash
   SEMIOTIC_SEED=7 SEMIOTIC_VOCAB=20 SEMIOTIC_D=32 \
-    SEMIOTIC_LAMBDA_COUPLE=1e-2 SEMIOTIC_LAMBDA_INSTAB=1e-3 \
-    SEMIOTIC_EPS_LIST="1e-4,5e-4,1e-3" SEMIOTIC_PROFILE_PATH=instability.csv \
-    SEMIOTIC_PROFILE_WIDTH=24 \
-    scripts/cognitive_probe.jl
+  SEMIOTIC_LAMBDA_COUPLE=1e-2 SEMIOTIC_LAMBDA_INSTAB=1e-3 \
+  SEMIOTIC_EPS_LIST="1e-4,5e-4,1e-3" SEMIOTIC_PROFILE_PATH=instability.csv \
+  SEMIOTIC_COUPLING_PATH=coupling.csv SEMIOTIC_PROFILE_WIDTH=24 \
+  scripts/cognitive_probe.jl
   ```
 
 ## Archetypal subcategories (V4) inside `SemioticTransformer`

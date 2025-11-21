@@ -36,6 +36,7 @@ global_λ_pair = envfloat("SEMIOTIC_GLOBAL_LAMBDA_PAIR", 0.5)
 ε_instab = envfloat("SEMIOTIC_EPS_INSTAB", 1e-3)
 instab_samples = envint("SEMIOTIC_INSTAB_SAMPLES", 1)
 profile_path = envstr("SEMIOTIC_PROFILE_PATH", "")
+coupling_path = envstr("SEMIOTIC_COUPLING_PATH", "")
 
 epsilons = begin
     raw = split(envstr("SEMIOTIC_EPS_LIST", ""), ",")
@@ -45,6 +46,7 @@ epsilons = begin
 end
 profile_width = envint("SEMIOTIC_PROFILE_WIDTH", 28)
 save_profile = isempty(profile_path) ? nothing : profile_path
+save_coupling = isempty(coupling_path) ? nothing : coupling_path
 
 probe = SemioticTransformer.cognitive_probe(
     vocab=vocab,
@@ -69,6 +71,7 @@ probe = SemioticTransformer.cognitive_probe(
     instab_samples=instab_samples,
     epsilons=isnothing(epsilons) ? SemioticTransformer.T[1f-4, 5f-4, 1f-3, 5f-3] : epsilons,
     save_profile=save_profile,
+    save_coupling=save_coupling,
     profile_width=profile_width,
 )
 
@@ -83,4 +86,11 @@ println("sparkline: $(probe.spark)")
 if !isnothing(save_profile)
     println("profile saved to: $(save_profile)")
 end
+if !isnothing(probe.coupling.path)
+    println("coupling matrix saved to: $(probe.coupling.path)")
+elseif !isempty(coupling_path)
+    println("coupling matrix target requested: $(coupling_path)")
+end
+println("coupling sparkline (proto minima): $(probe.coupling.spark)")
+println("coupling heatmap:\n$(probe.heatmaps.coupling)")
 println("heatmaps (potential/difference/grad_norms):\n$(probe.heatmaps.potential)\n---\n$(probe.heatmaps.difference)\n---\n$(probe.heatmaps.grad_norms)")
