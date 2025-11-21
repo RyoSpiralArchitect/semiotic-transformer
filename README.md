@@ -34,17 +34,40 @@ multi-path meaning recomposition.
 
 ## Quick start
 
-With the code under `src/`, you can load the package directly after activating
-the project (compatible with Flux `0.14` through `0.16`):
+1. Clone and activate the project (Flux `0.14`–`0.16` are supported):
 
-```julia
-julia --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate(); using SemioticTransformer'
-```
+   ```bash
+   git clone https://github.com/you/semiotic-transformer.git
+   cd semiotic-transformer
+   julia --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate()'
+   ```
+
+2. See something run immediately. The module file now self-hosts a tiny demo, so
+   you can execute it directly:
+
+   ```bash
+   julia --project=. src/SemioticTransformer.jl
+   ```
+
+   You should see logging as the archetypal toy loop trains for a few dozen
+   steps.
+
+3. Run the same demo via a helper script that activates the project, honours an
+   optional `SEMIOTIC_SEED`, and gives you a single command to copy/paste:
+
+   ```bash
+   SEMIOTIC_SEED=42 julia scripts/toy_train.jl
+   ```
+
+4. Import and call the same demo from the REPL or a script:
+
+   ```julia
+   julia --project=. -e 'using SemioticTransformer; SemioticTransformer.toy_train()'
+   ```
 
 If you prefer the explicit bootstrap that activates and instantiates the
 project for you, the top-level `SemioticTransformer.jl` still performs that
-step before loading the module. You can opt out with
-`SEMIOTIC_BOOTSTRAP=0`:
+step before loading the module. You can opt out with `SEMIOTIC_BOOTSTRAP=0`:
 
 ```julia
 julia --project=. -e 'include("SemioticTransformer.jl"); using .SemioticTransformer'
@@ -58,10 +81,11 @@ julia scripts/instantiate.jl
 julia --project=. -e 'include("SemioticTransformer.jl"); using .SemioticTransformer'
 ```
 
-You can then run the toy optimiser step:
+For a quick health check, a lightweight test now exercises the embedding,
+forward pass, and loss helpers on a tiny synthetic batch:
 
-```julia
-julia> SemioticTransformer.toy_train()
+```bash
+julia --project=. -e 'using Pkg; Pkg.test()'
 ```
 
 By default the toy example wires a SemioticSquare over the first four vocabulary
@@ -136,6 +160,43 @@ model = SemioticModel(vocab, d; squares=squares)
 * **JND calibration** – tune `λ_jnd` and the `(k, θ)` pair inside `jnd_loss` so
   small perturbations are neither collapsed nor exaggerated by the difference
   metric.
+
+## Extra-semiotic meaning: instability of the meaning field
+
+“Meaning outside meaning” shows up as a change in interpretation without any
+symbolic change. In this model that maps to **how sensitive the meaning field’s
+gradient is to tiny, non-symbolic perturbations**. We can instrument that
+directly:
+
+* The helper `meaning_instability(mf, X; ε, samples)` measures how much the
+  meaning gradient `∇Φ` jumps when every token embedding is nudged by noise
+  `ε·N(0, I)`. Formally,
+
+  ```
+  Δ∇Φ = ∇Φ(x + ε) - ∇Φ(x)
+  L_extra = mean‖Δ∇Φ‖²
+  ```
+
+* Wire this into the loss as a “meaning-instability penalty” to encourage
+  robustness to non-symbolic jolts while keeping symbolic structure intact:
+
+  ```julia
+  loss, parts = SemioticTransformer.lossfn(model, tokens;
+      λ_instab=1f-2, ε_instab=1f-3, instab_samples=4)
+  @info parts.Linstab  # ≈ extra-semiotic volatility
+  ```
+
+* For manual probes, pull the top block’s meaning field and state activations
+  from `forward` and call the helper directly:
+
+  ```julia
+  logits, KL, recL, acts = SemioticTransformer.forward(model, tokens)
+  L_extra = SemioticTransformer.meaning_instability(model.blocks[end].mf, acts;
+      ε=5f-4, samples=8)
+  ```
+
+The penalty is zero by default; enable it when you want to monitor or suppress
+extra-semiotic drift induced by silence, timing, or other non-symbolic cues.
 
 ## Archetypal subcategories (V4) inside `SemioticTransformer`
 

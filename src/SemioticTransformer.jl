@@ -112,6 +112,34 @@ function potential_grad(mf::MeaningField, x::AbstractVector{T})
     return mf.scale .* g
 end
 
+function meaning_instability(mf::MeaningField, X::AbstractMatrix{T}; ε::T=T(1e-3), samples::Int=1)
+    d, n = size(X)
+    accum = zero(T)
+    @inbounds for _ in 1:samples
+        noise = ε .* randn(T, d, n)
+        for j in 1:n
+            x = view(X, :, j)
+            Δ = potential_grad(mf, x) .- potential_grad(mf, x .+ view(noise, :, j))
+            accum += sum(abs2, Δ)
+        end
+    end
+    return accum / (samples * n)
+end
+
+function meaning_instability(mf::MeaningField, X::AbstractArray{T,3}; ε::T=T(1e-3), samples::Int=1)
+    d, n, batches = size(X)
+    accum = zero(T)
+    @inbounds for _ in 1:samples
+        noise = ε .* randn(T, d, n, batches)
+        for b in 1:batches, j in 1:n
+            x = view(X, :, j, b)
+            Δ = potential_grad(mf, x) .- potential_grad(mf, x .+ view(noise, :, j, b))
+            accum += sum(abs2, Δ)
+        end
+    end
+    return accum / (samples * n * batches)
+end
+
 function update!(mf::MeaningField, X::AbstractMatrix{T}; τ=T(0.95), temp=T(1.0))
     d, n = size(X)
     k = size(mf.P, 2)
@@ -639,7 +667,7 @@ function _negation_penalty(blocks::Vector{SemioticBlock}; kw...)
     return L
 end
 
-function lossfn(m::SemioticModel, tokens::AbstractVector{<:Integer}, targets::AbstractVector{<:Integer}; λ_square=T(0.05), λ_neg=T(1e-3), λ_KL=T(1e-3), λ_rec=T(1e-2), λ_self=T(1e-2), λ_jnd=T(1e-3), pad_token::Union{Nothing,Int}=nothing, update_field::Bool=false, will::Bool=true)
+function lossfn(m::SemioticModel, tokens::AbstractVector{<:Integer}, targets::AbstractVector{<:Integer}; λ_square=T(0.05), λ_neg=T(1e-3), λ_KL=T(1e-3), λ_rec=T(1e-2), λ_self=T(1e-2), λ_jnd=T(1e-3), λ_instab::T=T(0.0), ε_instab::T=T(1e-3), instab_samples::Int=1, pad_token::Union{Nothing,Int}=nothing, update_field::Bool=false, will::Bool=true)
     logits, KL, recL, X = forward(m, tokens; update_field=update_field, will=will)
     Lce = _ce_loss(logits, targets; pad_token=pad_token)
     top_block = m.blocks[end]
@@ -647,11 +675,12 @@ function lossfn(m::SemioticModel, tokens::AbstractVector{<:Integer}, targets::Ab
     Lneg = _negation_penalty(m.blocks; λ_inv=T(1e-3), λ_iso=T(1e-3), λ_sym=T(1e-4))
     Lsq = square_penalty(m.emb.weight, m.squares)
     Ljnd = jnd_loss(top_block.df, X; k=T(0.08), θ=T(0.05))
-    L = Lce + λ_KL * KL + λ_rec * recL + λ_square * Lsq + λ_neg * Lneg + λ_self * Lself + λ_jnd * Ljnd
-    return L, (; Lce, KL, recL, Lsq, Lneg, Lself, Ljnd)
+    Linstab = iszero(λ_instab) ? zero(T) : meaning_instability(top_block.mf, X; ε=ε_instab, samples=instab_samples)
+    L = Lce + λ_KL * KL + λ_rec * recL + λ_square * Lsq + λ_neg * Lneg + λ_self * Lself + λ_jnd * Ljnd + λ_instab * Linstab
+    return L, (; Lce, KL, recL, Lsq, Lneg, Lself, Ljnd, Linstab)
 end
 
-function lossfn(m::SemioticModel, tokens::AbstractMatrix{<:Integer}, targets::AbstractMatrix{<:Integer}; λ_square=T(0.05), λ_neg=T(1e-3), λ_KL=T(1e-3), λ_rec=T(1e-2), λ_self=T(1e-2), λ_jnd=T(1e-3), pad_token::Union{Nothing,Int}=nothing, update_field::Bool=false, will::Bool=true)
+function lossfn(m::SemioticModel, tokens::AbstractMatrix{<:Integer}, targets::AbstractMatrix{<:Integer}; λ_square=T(0.05), λ_neg=T(1e-3), λ_KL=T(1e-3), λ_rec=T(1e-2), λ_self=T(1e-2), λ_jnd=T(1e-3), λ_instab::T=T(0.0), ε_instab::T=T(1e-3), instab_samples::Int=1, pad_token::Union{Nothing,Int}=nothing, update_field::Bool=false, will::Bool=true)
     logits, KL, recL, X = forward(m, tokens; update_field=update_field, will=will)
     Lce = _ce_loss(logits, targets; pad_token=pad_token)
     top_block = m.blocks[end]
@@ -659,8 +688,9 @@ function lossfn(m::SemioticModel, tokens::AbstractMatrix{<:Integer}, targets::Ab
     Lneg = _negation_penalty(m.blocks; λ_inv=T(1e-3), λ_iso=T(1e-3), λ_sym=T(1e-4))
     Lsq = square_penalty(m.emb.weight, m.squares)
     Ljnd = jnd_loss(top_block.df, X; k=T(0.08), θ=T(0.05))
-    L = Lce + λ_KL * KL + λ_rec * recL + λ_square * Lsq + λ_neg * Lneg + λ_self * Lself + λ_jnd * Ljnd
-    return L, (; Lce, KL, recL, Lsq, Lneg, Lself, Ljnd)
+    Linstab = iszero(λ_instab) ? zero(T) : meaning_instability(top_block.mf, X; ε=ε_instab, samples=instab_samples)
+    L = Lce + λ_KL * KL + λ_rec * recL + λ_square * Lsq + λ_neg * Lneg + λ_self * Lself + λ_jnd * Ljnd + λ_instab * Linstab
+    return L, (; Lce, KL, recL, Lsq, Lneg, Lself, Ljnd, Linstab)
 end
 
 function lossfn(m::SemioticModel, sequence::AbstractVector{<:Integer}; kwargs...)
@@ -1255,3 +1285,8 @@ end
 end # module Archetypal
 
 end # module
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    @info "Running toy training loop from SemioticTransformer.jl"
+    SemioticTransformer.toy_train()
+end
