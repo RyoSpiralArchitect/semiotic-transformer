@@ -28,6 +28,10 @@ multi-path meaning recomposition.
   penalties are accumulated across blocks.
 * **MeaningChainLayer** – separates denotation, connotation, and mythic
   pathways and recombines them with a learned softmax gate.
+* **ψ-lattice snapshots + archetypal bridge** – grab the current meaning field
+  state via `PsiState`, and plug the SemioticModel (local ψ-flow) into the
+  ArchetypalModel (global myth/structure) through a shared embedding and a
+  lightweight coupling penalty.
 * **Batch- and padding-aware utilities** – forward and loss helpers accept both
   single sequences and column-stacked batches; supply `pad_token` to mask padded
   targets in the cross-entropy term while leaving semiotic penalties active.
@@ -241,6 +245,37 @@ extra-semiotic drift induced by silence, timing, or other non-symbolic cues.
   DifferenceField map, and the gradient norms `‖∇Φ‖` per token. The helper
   `ascii_heatmap` is available if you want to render your own matrices the same
   way.
+
+### ψ-lattice snapshots + archetypal bridge (shared embedding)
+
+* **Peek at the ψ-lattice.** Every forward pass returns activations you can wrap
+  into a `PsiState` for the top block:
+
+  ```julia
+  logits, KL, recL, acts = SemioticTransformer.forward(model, tokens)
+  ψ = SemioticTransformer.psi_state(model, acts)
+  ψ.Φ        # meaning potential per token
+  ψ.diff     # token–token difference matrix
+  ```
+
+* **Share the embedding across local (ψ) and global (archetypal) engines.** The
+  `CognitiveModel` builds both models on a single embedding so the local flow and
+  global archetypes live in the same space:
+
+  ```julia
+  cog = SemioticTransformer.CognitiveModel(vocab, d; local_layers=1, global_K=4)
+  context, targets = SemioticTransformer.next_token_pairs(tokens)
+  loss, parts = SemioticTransformer.lossfn(cog, context, targets;
+      λ_global=0.5f0, λ_couple=1f-3)
+  parts.Lcouple          # alignment of ψ prototypes with archetypal centers
+  parts.local.Linstab    # instability of the ψ-lattice
+  parts.global.Lstruct   # archetypal structural regularity
+  ```
+
+* **Couple ψ-prototypes to archetypal centers.** The helper
+  `coupling_penalty(local, global)` measures how close the SemioticModel’s
+  meaning prototypes sit to archetypal centers, letting you tune how tightly the
+  local flow should align with the global mythic structure.
 
 ## Archetypal subcategories (V4) inside `SemioticTransformer`
 
