@@ -112,6 +112,70 @@ function potential_grad(mf::MeaningField, x::AbstractVector{T})
     return mf.scale .* g
 end
 
+function meaning_instability(mf::MeaningField, X::AbstractMatrix{T}; ε::T=T(1e-3), samples::Int=1)
+    d, n = size(X)
+    accum = zero(T)
+    @inbounds for _ in 1:samples
+        noise = ε .* randn(T, d, n)
+        for j in 1:n
+            x = view(X, :, j)
+            Δ = potential_grad(mf, x) .- potential_grad(mf, x .+ view(noise, :, j))
+            accum += sum(abs2, Δ)
+        end
+    end
+    return accum / (samples * n)
+end
+
+function meaning_instability(mf::MeaningField, X::AbstractArray{T,3}; ε::T=T(1e-3), samples::Int=1)
+    d, n, batches = size(X)
+    accum = zero(T)
+    @inbounds for _ in 1:samples
+        noise = ε .* randn(T, d, n, batches)
+        for b in 1:batches, j in 1:n
+            x = view(X, :, j, b)
+            Δ = potential_grad(mf, x) .- potential_grad(mf, x .+ view(noise, :, j, b))
+            accum += sum(abs2, Δ)
+        end
+    end
+    return accum / (samples * n * batches)
+end
+
+function meaning_instability_profile(mf::MeaningField, X; epsilons::AbstractVector{T}=T[1f-4, 5f-4, 1f-3, 5f-3], samples::Int=4)
+    return [(ϵ, meaning_instability(mf, X; ε=ϵ, samples=samples)) for ϵ in epsilons]
+end
+
+function instability_sparkline(profile; width::Int=28)
+    isempty(profile) && return ""
+    vals = [p[2] for p in profile]
+    lo, hi = extrema(vals)
+    span = max(hi - lo, eps(T))
+    chars = collect("▁▂▃▄▅▆▇█")
+    step = max(1, ceil(Int, length(vals) / width))
+    io = IOBuffer()
+    @inbounds for idx in 1:step:length(vals)
+        v = vals[idx]
+        level = clamp(Int(floor((v - lo) / span * (length(chars) - 1))) + 1, 1, length(chars))
+        print(io, chars[level])
+    end
+    return String(take!(io))
+end
+
+function instability_profile_table(profile)
+    io = IOBuffer()
+    println(io, "epsilon,instability")
+    for (ϵ, val) in profile
+        println(io, "$(ϵ),$(val)")
+    end
+    return String(take!(io))
+end
+
+function save_instability_profile(path::AbstractString, profile)
+    open(path, "w") do io
+        println(io, instability_profile_table(profile))
+    end
+    return path
+end
+
 function update!(mf::MeaningField, X::AbstractMatrix{T}; τ=T(0.95), temp=T(1.0))
     d, n = size(X)
     k = size(mf.P, 2)
@@ -639,7 +703,7 @@ function _negation_penalty(blocks::Vector{SemioticBlock}; kw...)
     return L
 end
 
-function lossfn(m::SemioticModel, tokens::AbstractVector{<:Integer}, targets::AbstractVector{<:Integer}; λ_square=T(0.05), λ_neg=T(1e-3), λ_KL=T(1e-3), λ_rec=T(1e-2), λ_self=T(1e-2), λ_jnd=T(1e-3), pad_token::Union{Nothing,Int}=nothing, update_field::Bool=false, will::Bool=true)
+function lossfn(m::SemioticModel, tokens::AbstractVector{<:Integer}, targets::AbstractVector{<:Integer}; λ_square=T(0.05), λ_neg=T(1e-3), λ_KL=T(1e-3), λ_rec=T(1e-2), λ_self=T(1e-2), λ_jnd=T(1e-3), λ_instab::T=T(0.0), ε_instab::T=T(1e-3), instab_samples::Int=1, pad_token::Union{Nothing,Int}=nothing, update_field::Bool=false, will::Bool=true)
     logits, KL, recL, X = forward(m, tokens; update_field=update_field, will=will)
     Lce = _ce_loss(logits, targets; pad_token=pad_token)
     top_block = m.blocks[end]
@@ -647,11 +711,12 @@ function lossfn(m::SemioticModel, tokens::AbstractVector{<:Integer}, targets::Ab
     Lneg = _negation_penalty(m.blocks; λ_inv=T(1e-3), λ_iso=T(1e-3), λ_sym=T(1e-4))
     Lsq = square_penalty(m.emb.weight, m.squares)
     Ljnd = jnd_loss(top_block.df, X; k=T(0.08), θ=T(0.05))
-    L = Lce + λ_KL * KL + λ_rec * recL + λ_square * Lsq + λ_neg * Lneg + λ_self * Lself + λ_jnd * Ljnd
-    return L, (; Lce, KL, recL, Lsq, Lneg, Lself, Ljnd)
+    Linstab = iszero(λ_instab) ? zero(T) : meaning_instability(top_block.mf, X; ε=ε_instab, samples=instab_samples)
+    L = Lce + λ_KL * KL + λ_rec * recL + λ_square * Lsq + λ_neg * Lneg + λ_self * Lself + λ_jnd * Ljnd + λ_instab * Linstab
+    return L, (; Lce, KL, recL, Lsq, Lneg, Lself, Ljnd, Linstab)
 end
 
-function lossfn(m::SemioticModel, tokens::AbstractMatrix{<:Integer}, targets::AbstractMatrix{<:Integer}; λ_square=T(0.05), λ_neg=T(1e-3), λ_KL=T(1e-3), λ_rec=T(1e-2), λ_self=T(1e-2), λ_jnd=T(1e-3), pad_token::Union{Nothing,Int}=nothing, update_field::Bool=false, will::Bool=true)
+function lossfn(m::SemioticModel, tokens::AbstractMatrix{<:Integer}, targets::AbstractMatrix{<:Integer}; λ_square=T(0.05), λ_neg=T(1e-3), λ_KL=T(1e-3), λ_rec=T(1e-2), λ_self=T(1e-2), λ_jnd=T(1e-3), λ_instab::T=T(0.0), ε_instab::T=T(1e-3), instab_samples::Int=1, pad_token::Union{Nothing,Int}=nothing, update_field::Bool=false, will::Bool=true)
     logits, KL, recL, X = forward(m, tokens; update_field=update_field, will=will)
     Lce = _ce_loss(logits, targets; pad_token=pad_token)
     top_block = m.blocks[end]
@@ -659,8 +724,9 @@ function lossfn(m::SemioticModel, tokens::AbstractMatrix{<:Integer}, targets::Ab
     Lneg = _negation_penalty(m.blocks; λ_inv=T(1e-3), λ_iso=T(1e-3), λ_sym=T(1e-4))
     Lsq = square_penalty(m.emb.weight, m.squares)
     Ljnd = jnd_loss(top_block.df, X; k=T(0.08), θ=T(0.05))
-    L = Lce + λ_KL * KL + λ_rec * recL + λ_square * Lsq + λ_neg * Lneg + λ_self * Lself + λ_jnd * Ljnd
-    return L, (; Lce, KL, recL, Lsq, Lneg, Lself, Ljnd)
+    Linstab = iszero(λ_instab) ? zero(T) : meaning_instability(top_block.mf, X; ε=ε_instab, samples=instab_samples)
+    L = Lce + λ_KL * KL + λ_rec * recL + λ_square * Lsq + λ_neg * Lneg + λ_self * Lself + λ_jnd * Ljnd + λ_instab * Linstab
+    return L, (; Lce, KL, recL, Lsq, Lneg, Lself, Ljnd, Linstab)
 end
 
 function lossfn(m::SemioticModel, sequence::AbstractVector{<:Integer}; kwargs...)
@@ -676,6 +742,24 @@ end
 # -----------------------------
 # Toy usage
 # -----------------------------
+_heat_levels() = collect(" ▁▂▃▄▅▆▇█")
+
+function ascii_heatmap(M::AbstractMatrix{<:Real}; levels=_heat_levels())
+    isempty(M) && return ""
+    lo, hi = extrema(M)
+    span = hi - lo
+    chars = IOBuffer()
+    nlevels = length(levels)
+    for i in 1:size(M, 1)
+        for j in 1:size(M, 2)
+            idx = span == 0 ? nlevels : clamp(Int(floor((M[i, j] - lo) / span * (nlevels - 1))) + 1, 1, nlevels)
+            print(chars, levels[idx])
+        end
+        i < size(M, 1) && print(chars, '\n')
+    end
+    return String(take!(chars))
+end
+
 function toy_train(; seed=7)
     Random.seed!(seed)
     vocab = 8; d = 64
@@ -695,10 +779,50 @@ function toy_train(; seed=7)
         _ = forward(m, tokens; update_field=true, will=true)
         if step % 10 == 0
             L, parts = lossfn(m, tokens, targets; λ_square=0.05f0, λ_neg=0.01f0)
-            @info "step=$step" loss=L parts
+            instab = meaning_instability(m.blocks[end].mf, X; ε=5f-4, samples=4)
+            @info "step=$step" loss=L instab parts
         end
     end
     return m
+end
+
+function instability_probe(; seed=2027, ε=5f-4, samples::Int=4, λ_instab=T(1f-2), epsilons::AbstractVector{T}=T[1f-4, 5f-4, 1f-3, 5f-3], visualize::Bool=true, save_profile::Union{Nothing,AbstractString}=nothing)
+    Random.seed!(seed)
+    vocab = 8; d = 64
+    sq = SemioticSquare(1, 2, 3, 4)
+    m = SemioticModel(vocab, d; layers=2, H=3, k=8, z=32, square=sq)
+
+    tokens  = [1, 2, 5, 6, 7, 3, 4, 2]
+    targets = [2, 1, 5, 6, 7, 4, 3, 1]
+
+    logits, KL, recL, acts = forward(m, tokens; update_field=true, will=true)
+    mf = m.blocks[end].mf
+    df = m.blocks[end].df
+
+    instab = meaning_instability(mf, acts; ε=ε, samples=samples)
+    sweep = meaning_instability_profile(mf, acts; epsilons=epsilons, samples=samples)
+    spark = instability_sparkline(sweep)
+    isnothing(save_profile) || save_instability_profile(save_profile, sweep)
+
+    loss, parts = lossfn(m, tokens, targets;
+        λ_square=0.05f0, λ_neg=0.01f0, λ_instab=λ_instab,
+        ε_instab=ε, instab_samples=samples)
+
+    potentials = potential(mf, acts)
+    diffmap = difference_matrix(df, acts)
+    grad_norms = [norm(potential_grad(mf, view(acts, :, j))) for j in 1:size(acts, 2)]
+
+    heatmaps = (
+        potential = ascii_heatmap(reshape(potentials, 1, :)),
+        difference = ascii_heatmap(diffmap),
+        grad_norms = ascii_heatmap(reshape(grad_norms, 1, :))
+    )
+
+    if visualize
+        @info "meaning-instability probe" instab sweep spark save_profile loss parts heatmaps
+    end
+
+    return (; instab, loss, parts, logits, KL, recL, sweep, spark, potentials, diffmap, grad_norms, heatmaps)
 end
 
 # =============================
@@ -1255,3 +1379,8 @@ end
 end # module Archetypal
 
 end # module
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    @info "Running toy training loop from SemioticTransformer.jl"
+    SemioticTransformer.toy_train()
+end
