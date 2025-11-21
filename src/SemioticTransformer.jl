@@ -1255,3 +1255,8 @@ end
 end # module Archetypal
 
 end # module
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    @info "Running toy training loop from SemioticTransformer.jl"
+    SemioticTransformer.toy_train()
+end
