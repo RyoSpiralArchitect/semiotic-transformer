@@ -144,6 +144,38 @@ function meaning_instability_profile(mf::MeaningField, X; epsilons::AbstractVect
     return [(ϵ, meaning_instability(mf, X; ε=ϵ, samples=samples)) for ϵ in epsilons]
 end
 
+function instability_sparkline(profile; width::Int=28)
+    isempty(profile) && return ""
+    vals = [p[2] for p in profile]
+    lo, hi = extrema(vals)
+    span = max(hi - lo, eps(T))
+    chars = collect("▁▂▃▄▅▆▇█")
+    step = max(1, ceil(Int, length(vals) / width))
+    io = IOBuffer()
+    @inbounds for idx in 1:step:length(vals)
+        v = vals[idx]
+        level = clamp(Int(floor((v - lo) / span * (length(chars) - 1))) + 1, 1, length(chars))
+        print(io, chars[level])
+    end
+    return String(take!(io))
+end
+
+function instability_profile_table(profile)
+    io = IOBuffer()
+    println(io, "epsilon,instability")
+    for (ϵ, val) in profile
+        println(io, "$(ϵ),$(val)")
+    end
+    return String(take!(io))
+end
+
+function save_instability_profile(path::AbstractString, profile)
+    open(path, "w") do io
+        println(io, instability_profile_table(profile))
+    end
+    return path
+end
+
 function update!(mf::MeaningField, X::AbstractMatrix{T}; τ=T(0.95), temp=T(1.0))
     d, n = size(X)
     k = size(mf.P, 2)
@@ -754,7 +786,7 @@ function toy_train(; seed=7)
     return m
 end
 
-function instability_probe(; seed=2027, ε=5f-4, samples::Int=4, λ_instab=T(1f-2), epsilons::AbstractVector{T}=T[1f-4, 5f-4, 1f-3, 5f-3], visualize::Bool=true)
+function instability_probe(; seed=2027, ε=5f-4, samples::Int=4, λ_instab=T(1f-2), epsilons::AbstractVector{T}=T[1f-4, 5f-4, 1f-3, 5f-3], visualize::Bool=true, save_profile::Union{Nothing,AbstractString}=nothing)
     Random.seed!(seed)
     vocab = 8; d = 64
     sq = SemioticSquare(1, 2, 3, 4)
@@ -769,6 +801,8 @@ function instability_probe(; seed=2027, ε=5f-4, samples::Int=4, λ_instab=T(1f-
 
     instab = meaning_instability(mf, acts; ε=ε, samples=samples)
     sweep = meaning_instability_profile(mf, acts; epsilons=epsilons, samples=samples)
+    spark = instability_sparkline(sweep)
+    isnothing(save_profile) || save_instability_profile(save_profile, sweep)
 
     loss, parts = lossfn(m, tokens, targets;
         λ_square=0.05f0, λ_neg=0.01f0, λ_instab=λ_instab,
@@ -785,10 +819,10 @@ function instability_probe(; seed=2027, ε=5f-4, samples::Int=4, λ_instab=T(1f-
     )
 
     if visualize
-        @info "meaning-instability probe" instab sweep loss parts heatmaps
+        @info "meaning-instability probe" instab sweep spark save_profile loss parts heatmaps
     end
 
-    return (; instab, loss, parts, logits, KL, recL, sweep, potentials, diffmap, grad_norms, heatmaps)
+    return (; instab, loss, parts, logits, KL, recL, sweep, spark, potentials, diffmap, grad_norms, heatmaps)
 end
 
 # =============================

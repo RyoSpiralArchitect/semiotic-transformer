@@ -25,6 +25,13 @@ using SemioticTransformer
     sweep = SemioticTransformer.meaning_instability_profile(model.blocks[end].mf, acts; epsilons=[1f-4, 1f-3], samples=2)
     @test length(sweep) == 2
     @test all(v -> v[2] >= 0 && isfinite(v[2]), sweep)
+    spark = SemioticTransformer.instability_sparkline(sweep; width=4)
+    @test !isempty(spark)
+    tmp = tempname()
+    SemioticTransformer.save_instability_profile(tmp, sweep)
+    @test isfile(tmp)
+    lines = readlines(tmp)
+    @test length(lines) == length(sweep) + 1
 
     heat = SemioticTransformer.ascii_heatmap(rand(Float32, 2, 3))
     @test !isempty(heat)

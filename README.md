@@ -68,11 +68,13 @@ multi-path meaning recomposition.
 5. Probe and visualise the extra-semiotic “meaning instability” metric directly. A helper
    script activates the project, wires in sensible defaults, and surfaces knobs
    via environment variables (sweep + ASCII heatmaps for potentials, difference
-   field, and ‖∇Φ‖ per token):
+   field, and ‖∇Φ‖ per token). The probe now also renders a sparkline of the
+   sweep and can persist the CSV to a user-specified location:
 
    ```bash
    SEMIOTIC_EPS=5e-4 SEMIOTIC_SAMPLES=4 SEMIOTIC_LAMBDA_INSTAB=1e-2 julia scripts/instability_probe.jl
    SEMIOTIC_EPS=1e-3 julia scripts/instability_viz.jl
+   SEMIOTIC_PROFILE_PATH=instability.csv julia scripts/instability_viz.jl
    ```
 
    You can call the same probe function from the REPL and inspect the returned
@@ -224,6 +226,14 @@ extra-semiotic drift induced by silence, timing, or other non-symbolic cues.
   logits, KL, recL, acts = SemioticTransformer.forward(model, tokens)
   sweep = SemioticTransformer.meaning_instability_profile(model.blocks[end].mf, acts;
       epsilons=[1f-4, 5f-4, 1f-3, 5f-3], samples=4)
+  ```
+
+* Convert that sweep to a compact, normalized sparkline or persist the CSV to a
+  file for downstream plotting tools:
+
+  ```julia
+  spark = SemioticTransformer.instability_sparkline(sweep)
+  SemioticTransformer.save_instability_profile("instability.csv", sweep)
   ```
 
 * Visualise the field without external plotting packages. `instability_probe`
