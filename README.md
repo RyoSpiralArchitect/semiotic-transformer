@@ -35,7 +35,7 @@ multi-path meaning recomposition.
 ## Quick start
 
 With the code under `src/`, you can load the package directly after activating
-the project:
+the project (compatible with Flux `0.14` through `0.16`):
 
 ```julia
 julia --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate(); using SemioticTransformer'
