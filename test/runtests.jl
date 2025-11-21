@@ -75,13 +75,16 @@ end
     @test cpen >= 0
 
     probe = SemioticTransformer.cognitive_probe(; vocab=vocab, d=d, seq=6, seed=7,
-        λ_global=0.25f0, λ_couple=5f-3, λ_instab=1f-3, instab_samples=2, profile_width=6)
+        λ_global=0.25f0, λ_couple=5f-3, λ_instab=1f-3, instab_samples=2, profile_width=6, λ_time=2f-3)
     @test isfinite(probe.Ltotal)
     @test probe.Lcouple >= 0
     @test isfinite(probe.local.Lce)
     @test isfinite(probe.global.Lce)
     @test probe.psi isa SemioticTransformer.PsiState
     @test isfinite(probe.instab)
+    @test probe.L_time >= 0
+    @test probe.flow !== nothing
+    @test probe.dev_state isa SemioticTransformer.Archetypal.DevState
     @test !isempty(probe.spark)
     @test !isempty(probe.sweep)
     @test !isempty(probe.heatmaps.potential)
@@ -90,4 +93,36 @@ end
     @test length(probe.coupling.proto_min) == local_k
     @test length(probe.coupling.center_min) == global_K
     @test !isempty(probe.heatmaps.coupling)
+end
+
+@testset "Archetypal time dynamics" begin
+    Random.seed!(7)
+    vocab = 8
+    d = 24
+    model = SemioticTransformer.Archetypal.ArchetypalModel(vocab, d; K=3, ds=12, r=8)
+
+    tokens = rand(1:vocab, 6)
+    targets = rand(1:vocab, 6)
+    dev = SemioticTransformer.Archetypal.DevState()
+
+    logits, Y, W, cache = SemioticTransformer.Archetypal.forward(model, tokens)
+    L_time, flow = SemioticTransformer.Archetypal.time_dynamics_loss(model.block, Y, W, dev; λ_time=1f-2)
+    @test isfinite(L_time)
+    @test flow.H_start >= 0
+    @test flow.conflict >= 0
+
+    L_struct, parts_struct = SemioticTransformer.Archetypal.lossfn(model, tokens, targets)
+    L_total, info = SemioticTransformer.Archetypal.total_loss(model, tokens, targets, dev; λ_time=1f-2)
+    @test isfinite(L_struct)
+    @test isfinite(L_total)
+    SemioticTransformer.Archetypal.update!(dev, info.parts; flow=info.flow)
+    @test 0f0 <= dev.m <= 1f0
+    @test 0f0 <= dev.s <= 1f0
+
+    L_base, _ = SemioticTransformer.Archetypal.base_loss(model, tokens, targets)
+    @test isfinite(L_base)
+
+    _, dev_state = SemioticTransformer.Archetypal.train_with_time(; seed=9, steps=5, λ_time=1f-2)
+    @test 0f0 <= dev_state.m <= 1f0
+    @test 0f0 <= dev_state.s <= 1f0
 end

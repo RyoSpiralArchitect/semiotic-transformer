@@ -21,6 +21,10 @@ multi-path meaning recomposition.
   used in attention and the Weber/JND constraint.
 * **Will-flow (Schopenhauer)** – optional `will_step!` nudges representations via
   `+η∇Φ - ρ∇D`, letting the field dynamics push token states.
+* **Developmental time dynamics** – archetypal runs can carry a slow-moving
+  `DevState` (maturity + stress) whose temporal regulariser rewards
+  Self-oriented integration over a sequence and penalises late-stage
+  regressions into Shadow/Trickster patterns.
 * **JND/Weber constraint (Fechner)** – `jnd_loss` calibrates the difference
   metric so small perturbations stay near a target detectability threshold.
 * **SemioticSquare constraints** – metric regularisers over vocabulary slots keep
@@ -283,11 +287,14 @@ extra-semiotic drift induced by silence, timing, or other non-symbolic cues.
   + heatmaps) drawn from the shared embedding. It now also emits a coupling
   distance matrix between ψ prototypes and archetypal centers, alongside a
   sparkline of the per-prototype minima and an ASCII heatmap for a quick visual
-  on alignment:
+  on alignment. Temporal regularisation is optional: set `λ_time` to penalise
+  late-sequence regressions and receive the flow metrics + updated `DevState`
+  snapshot in the probe output:
 
   ```julia
   probe = SemioticTransformer.cognitive_probe(; vocab=24, d=32, seq=12,
       λ_global=0.5f0, λ_couple=1f-2, λ_instab=1f-3, instab_samples=4,
+      λ_time=5f-3,
       epsilons=[1f-4, 5f-4, 1f-3], profile_width=20,
       save_profile="instability.csv")
   probe.Ltotal   # combined ψ + archetype + coupling loss
@@ -296,6 +303,9 @@ extra-semiotic drift induced by silence, timing, or other non-symbolic cues.
   probe.psi.Φ    # meaning potentials for the sampled sequence
   probe.spark    # normalized instability sparkline
   probe.coupling # distance matrix, proto/center minima, sparkline, csv path
+  probe.L_time   # temporal drift penalty (0 if disabled)
+  probe.flow     # entropy + conflict metrics per sequence
+  probe.dev_state# updated maturity/stress snapshot
   probe.heatmaps # potential / difference / grad_norm / coupling ASCII blocks
   ```
 
@@ -306,7 +316,42 @@ extra-semiotic drift induced by silence, timing, or other non-symbolic cues.
   SEMIOTIC_LAMBDA_COUPLE=1e-2 SEMIOTIC_LAMBDA_INSTAB=1e-3 \
   SEMIOTIC_EPS_LIST="1e-4,5e-4,1e-3" SEMIOTIC_PROFILE_PATH=instability.csv \
   SEMIOTIC_COUPLING_PATH=coupling.csv SEMIOTIC_PROFILE_WIDTH=24 \
+  SEMIOTIC_LAMBDA_TIME=5e-3 \
   scripts/cognitive_probe.jl
+  ```
+
+### Temporal development and regression dynamics
+
+* **Track a slow “psychic state.”** Archetypal runs can maintain a `DevState`
+  with maturity `m∈[0,1]` and stress `s∈[0,1]`. `update!` blends cross-entropy
+  pressure with archetypal conflicts to raise stress, while individuation/structural
+  coherence pushes maturity up and stress pulls it back down.
+
+  ```julia
+  dev = SemioticTransformer.Archetypal.DevState()
+  L, info = SemioticTransformer.Archetypal.total_loss(model, tokens, targets, dev; λ_time=1e-2)
+  SemioticTransformer.Archetypal.update!(dev, info.parts; flow=info.flow)
+  info.flow  # entropy drift + Persona/Shadow, Anima/Animus conflict
+  dev        # evolving maturity/stress snapshot
+  ```
+
+* **Sequence-wise time regulariser.** `time_dynamics_loss` inspects the router
+  weights `W (K×n)` over a sequence: it favours entropy that declines over time,
+  Self activation that rises toward the end, smooth archetype transitions, and
+  penalises late Self→Shadow collapses. The weight `λ_time` controls how strongly
+  the temporal term influences the total archetypal loss.
+
+  ```julia
+  L_time, flow = SemioticTransformer.Archetypal.time_dynamics_loss(model.block, Y, W, dev; λ_time=5f-3)
+  ```
+
+* **End-to-end developmental training.** `train_with_time` wires everything
+  together: the standard archetypal loss, the temporal regulariser, and the
+  `DevState` update loop. Use it as a template for your own curricula or
+  integrate the `total_loss` helper into custom optimisers.
+
+  ```julia
+  m, dev = SemioticTransformer.Archetypal.train_with_time(; steps=120, λ_time=1e-2)
   ```
 
 ## Archetypal subcategories (V4) inside `SemioticTransformer`

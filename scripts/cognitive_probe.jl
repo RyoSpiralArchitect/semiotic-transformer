@@ -32,6 +32,7 @@ global_λ_pair = envfloat("SEMIOTIC_GLOBAL_LAMBDA_PAIR", 0.5)
 λ_struct = envfloat("SEMIOTIC_LAMBDA_STRUCT", 1e-3)
 λ_rules = envfloat("SEMIOTIC_LAMBDA_RULES", 1e-2)
 λ_mono = envfloat("SEMIOTIC_LAMBDA_MONO", 1e-3)
+λ_time = envfloat("SEMIOTIC_LAMBDA_TIME", 0.0)
 λ_instab = envfloat("SEMIOTIC_LAMBDA_INSTAB", 0.0)
 ε_instab = envfloat("SEMIOTIC_EPS_INSTAB", 1e-3)
 instab_samples = envint("SEMIOTIC_INSTAB_SAMPLES", 1)
@@ -66,6 +67,7 @@ probe = SemioticTransformer.cognitive_probe(
     λ_struct=λ_struct,
     λ_rules=λ_rules,
     λ_mono=λ_mono,
+    λ_time=λ_time,
     λ_instab=λ_instab,
     ε_instab=ε_instab,
     instab_samples=instab_samples,
@@ -83,6 +85,9 @@ println("global: $(probe.global)")
 println("psi snapshot potential mean: $(mean(probe.psi.Φ))")
 println("instability: $(probe.instab)")
 println("sparkline: $(probe.spark)")
+println("L_time=$(probe.L_time)")
+println("flow: $(probe.flow)")
+println("DevState: m=$(probe.dev_state.m), s=$(probe.dev_state.s)")
 if !isnothing(save_profile)
     println("profile saved to: $(save_profile)")
 end

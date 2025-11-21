@@ -849,9 +849,100 @@ module Archetypal
 
 using Flux, LinearAlgebra, Random, NNlib, Functors
 import ..SemioticTransformer
-using ..SemioticTransformer: T, Negation, negation_penalty, DifferenceField, difference_matrix,
-    MeaningField, potential, potential_grad, update!, MeaningChainLayer, SelfField, coniunctio,
-    _apply_layernorm, _apply_dense, next_token_pairs, _ce_loss
+    using ..SemioticTransformer: T, Negation, negation_penalty, DifferenceField, difference_matrix,
+        MeaningField, potential, potential_grad, update!, MeaningChainLayer, SelfField, coniunctio,
+        _apply_layernorm, _apply_dense, next_token_pairs, _ce_loss
+
+    struct DevState
+        m::Float32
+        s::Float32
+    end
+
+    DevState(; m=0.1f0, s=0.0f0) = DevState(Float32(m), Float32(s))
+
+    entropy(w::AbstractVector{T}) where {T} = -sum(p -> p > eps(T) ? p * log(p) : zero(T), w)
+
+    function flow_metrics(W::AbstractMatrix{T}) where {T}
+        K, n = size(W)
+        H_start = entropy(view(W, :, 1))
+        H_end = entropy(view(W, :, n))
+
+        H_mean = zero(T)
+        @inbounds @views for t in 1:n
+            H_mean += entropy(view(W, :, t))
+        end
+        H_mean /= n
+
+        conflict_ps = (K >= 3) ? mean(W[2, :] .* W[3, :]) : zero(T)
+        conflict_aa = (K >= 5) ? mean(W[4, :] .* W[5, :]) : zero(T)
+
+        return (H_start=H_start, H_end=H_end, H_mean=H_mean, conflict=conflict_ps + conflict_aa)
+    end
+
+    function _getprop(parts, name::Symbol, default)
+        return name in propertynames(parts) ? getproperty(parts, name) : default
+    end
+
+    function update!(st::DevState, parts; flow=nothing, η_m=0.03f0, η_s=0.08f0)
+        base_stress = clamp(_getprop(parts, :Lce, 0f0) / 5f0, 0f0, 1f0)
+        conflict = flow === nothing ? 0f0 : flow.conflict
+        st.s = clamp(st.s + η_s * (0.6f0 * base_stress + 0.4f0 * conflict - 0.3f0 * st.s), 0f0, 1f0)
+
+        lind = _getprop(parts, :Lind, _getprop(parts, :Lstruct, 0f0))
+        integ = exp(-lind)
+        reg = st.s
+        st.m = clamp(st.m + η_m * (0.7f0 * integ - 0.5f0 * reg), 0f0, 1f0)
+
+        return st
+    end
+
+    function time_dynamics_loss(block::ArchetypalBlock,
+            Y::AbstractMatrix{T},
+            W::AbstractMatrix{T},
+            dev::DevState;
+            λ_time::T=T(1e-2)) where {T}
+
+        K, n = size(W)
+        fm = flow_metrics(W)
+
+        ΔH = fm.H_end - fm.H_start
+        L_dir = dev.m * NNlib.relu(ΔH)^2
+
+        L_self = zero(T)
+        if K >= 1 && n >= 2
+            s_first = mean(W[1, 1:clamp(div(n, 3), 1, n)])
+            s_last = mean(W[1, max(1, n - div(n, 3)):n])
+            target = dev.m * T(0.5)
+            L_self = ((s_last - s_first) - target)^2
+        end
+
+        L_smooth = zero(T)
+        @inbounds @views for t in 1:n-1
+            dt = view(W, :, t + 1) .- view(W, :, t)
+            L_smooth += mean(abs2, dt)
+        end
+        L_smooth /= max(T(n - 1), T(1))
+        L_smooth_scaled = (0.3f0 + 0.7f0 * dev.m) * L_smooth
+
+        L_reg = zero(T)
+        if K >= 3 && n >= 3
+            from = max(2, n - div(n, 3))
+            @inbounds @views for t in from:(n - 1)
+                s_now = W[1, t]
+                s_next = W[1, t + 1]
+                sh_now = W[3, t]
+                sh_next = W[3, t + 1]
+                drop_self = NNlib.relu(s_now - s_next)
+                rise_shadow = NNlib.relu(sh_next - sh_now)
+                L_reg += drop_self * rise_shadow
+            end
+            L_reg /= max(T(n - from), T(1))
+        end
+        L_reg_scaled = dev.m * L_reg
+
+        L = L_dir + L_self + L_smooth_scaled + L_reg_scaled
+        return λ_time * L, fm
+    end
 
 struct Obj
     d::Int
@@ -1361,24 +1452,39 @@ function lossfn(m::ArchetypalModel, tokens::AbstractMatrix{<:Integer}; pad_token
         λ_mono=λ_mono, update_fields=update_fields, will=will)
 end
 
-function lossfn(m::ArchetypalModel, tokens::AbstractVector{<:Integer}, targets::AbstractVector{<:Integer};
+    function lossfn(m::ArchetypalModel, tokens::AbstractVector{<:Integer}, targets::AbstractVector{<:Integer};
         pad_token::Union{Nothing,Int}=nothing, λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3), λ_mono=T(1e-3),
         update_fields::Bool=false, will::Bool=true)
-    X = m.emb(tokens)
-    return _archetypal_loss_embedded(m, X, targets; pad_token=pad_token, λ_struct=λ_struct, λ_rules=λ_rules, λ_jnd=λ_jnd, λ_mono=λ_mono, update_fields=update_fields, will=will)
-end
+        X = m.emb(tokens)
+        return _archetypal_loss_embedded(m, X, targets; pad_token=pad_token, λ_struct=λ_struct, λ_rules=λ_rules, λ_jnd=λ_jnd, λ_mono=λ_mono, update_fields=update_fields, will=will)
+    end
 
-function lossfn(m::ArchetypalModel, tokens::AbstractMatrix{<:Integer}, targets::AbstractMatrix{<:Integer};
+    function lossfn(m::ArchetypalModel, tokens::AbstractMatrix{<:Integer}, targets::AbstractMatrix{<:Integer};
         pad_token::Union{Nothing,Int}=nothing, λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3), λ_mono=T(1e-3),
         update_fields::Bool=false, will::Bool=true)
-    X = m.emb(tokens)
-    return _archetypal_loss_embedded(m, X, targets; pad_token=pad_token, λ_struct=λ_struct, λ_rules=λ_rules, λ_jnd=λ_jnd, λ_mono=λ_mono, update_fields=update_fields, will=will)
-end
+        X = m.emb(tokens)
+        return _archetypal_loss_embedded(m, X, targets; pad_token=pad_token, λ_struct=λ_struct, λ_rules=λ_rules, λ_jnd=λ_jnd, λ_mono=λ_mono, update_fields=update_fields, will=will)
+    end
 
-function toy_train(; seed=2025)
-    Random.seed!(seed)
-    vocab = 12
-    d = 64
+    base_loss(args...; kwargs...) = lossfn(args...; kwargs...)
+
+    function total_loss(m::ArchetypalModel, tokens::AbstractVector{<:Integer}, targets::AbstractVector{<:Integer}, dev::DevState;
+            pad_token::Union{Nothing,Int}=nothing, λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3), λ_mono=T(1e-3),
+            λ_time::T=T(1e-2), update_fields::Bool=false, will::Bool=true)
+
+        logits, Y, W, cache = forward(m, tokens; update_fields=update_fields, will=will)
+        L_struct, parts_struct = _archetypal_loss_from_forward(m, logits, Y, cache.locals, targets;
+            pad_token=pad_token, λ_struct=λ_struct, λ_rules=λ_rules, λ_jnd=λ_jnd, λ_mono=λ_mono)
+
+        L_time, flow = time_dynamics_loss(m.block, Y, W, dev; λ_time=λ_time)
+        L_total = L_struct + L_time
+        return L_total, (parts=parts_struct, flow=flow, L_struct=L_struct, L_time=L_time)
+    end
+
+    function toy_train(; seed=2025)
+        Random.seed!(seed)
+        vocab = 12
+        d = 64
     K = 6
     ds = 32
     r = 32
@@ -1403,7 +1509,42 @@ function toy_train(; seed=2025)
         end
     end
     m
-end
+    end
+
+    function train_with_time(; seed=2025, steps=200, λ_time=T(1e-2))
+        Random.seed!(seed)
+        vocab = 12
+        d = 64
+        K = 6
+        ds = 32
+        r = 32
+        m = ArchetypalModel(vocab, d; K=K, ds=ds, r=r)
+
+        tokens = [1, 2, 5, 6, 7, 3, 4, 2, 9, 10]
+        targets = [2, 1, 5, 6, 7, 4, 3, 1, 10, 9]
+
+        opt = Flux.setup(Flux.Optimisers.Adam(1e-3), m)
+        dev = DevState()
+
+        for step in 1:steps
+            _ = Float32(step / steps)
+
+            gs = Flux.gradient(Flux.params(m)) do
+                L, _ = total_loss(m, tokens, targets, dev; λ_time=λ_time)
+                L
+            end
+            Flux.update!(opt, Flux.params(m), gs)
+
+            Ltot, info = total_loss(m, tokens, targets, dev; λ_time=λ_time)
+            update!(dev, info.parts; flow=info.flow)
+
+            if step % 20 == 0
+                @info "step=$step" L=Ltot dev=dev flow=info.flow parts=info.parts
+            end
+        end
+
+        return m, dev
+    end
 
 end # module Archetypal
 
@@ -1491,10 +1632,10 @@ end
 
 function forward(m::CognitiveModel, X; update_fields::Bool=false, will_local::Bool=true, will_global::Bool=true)
     local_logits, KL, recL, acts_local = forward(m.local, X; update_field=update_fields, will=will_local)
-    global_logits, codes, W, cache_global = forward(m.global, X; update_fields=update_fields, will=will_global)
+    global_logits, acts_global, W, cache_global = forward(m.global, X; update_fields=update_fields, will=will_global)
     return (
         local = (; logits=local_logits, KL=KL, recL=recL, acts=acts_local),
-        global = (; logits=global_logits, codes=codes, weights=W, cache=cache_global),
+        global = (; logits=global_logits, acts=acts_global, weights=W, cache=cache_global),
         psi = psi_state(m.local, acts_local),
     )
 end
@@ -1523,17 +1664,24 @@ function lossfn(m::CognitiveModel, tokens, targets; pad_token::Union{Nothing,Int
         λ_square::T=T(0.05), λ_neg::T=T(1e-3), λ_KL::T=T(1e-3), λ_rec::T=T(1e-2), λ_self::T=T(1e-2), λ_jnd::T=T(1e-3),
         λ_instab::T=T(0.0), ε_instab::T=T(1e-3), instab_samples::Int=1,
         λ_struct::T=T(1e-3), λ_rules::T=T(1e-2), λ_mono::T=T(1e-3), λ_global::T=T(1f0),
-        λ_couple::T=T(1e-3), update_fields::Bool=false, will_local::Bool=true, will_global::Bool=true)
+        λ_couple::T=T(1e-3), λ_time::T=T(0f0), dev_state::Union{Nothing,Archetypal.DevState}=nothing,
+        update_fields::Bool=false, will_local::Bool=true, will_global::Bool=true)
     X = m.emb(tokens)
     local_logits, KL, recL, acts_local = forward(m.local, X; update_field=update_fields, will=will_local)
     L_local, parts_local = _semiotic_loss_from_forward(m.local, local_logits, acts_local, targets; KL=KL, recL=recL, pad_token=pad_token, λ_square=λ_square, λ_neg=λ_neg, λ_KL=λ_KL, λ_rec=λ_rec, λ_self=λ_self, λ_jnd=λ_jnd, λ_instab=λ_instab, ε_instab=ε_instab, instab_samples=instab_samples)
 
-    global_logits, codes, _, cache_global = forward(m.global, X; update_fields=update_fields, will=will_global)
-    L_global, parts_global = _archetypal_loss_from_forward(m.global, global_logits, codes, cache_global.locals, targets; pad_token=pad_token, λ_struct=λ_struct, λ_rules=λ_rules, λ_jnd=λ_jnd, λ_mono=λ_mono)
+    global_logits, acts_global, W, cache_global = forward(m.global, X; update_fields=update_fields, will=will_global)
+    L_global, parts_global = _archetypal_loss_from_forward(m.global, global_logits, acts_global, cache_global.locals, targets; pad_token=pad_token, λ_struct=λ_struct, λ_rules=λ_rules, λ_jnd=λ_jnd, λ_mono=λ_mono)
+
+    L_time = zero(T)
+    flow = nothing
+    if dev_state !== nothing && λ_time != 0
+        L_time, flow = Archetypal.time_dynamics_loss(m.global.block, acts_global, W, dev_state; λ_time=λ_time)
+    end
 
     Lcouple = coupling_penalty(m.local, m.global)
-    L = L_local + λ_global * L_global + λ_couple * Lcouple
-    return L, (; local=parts_local, global=parts_global, Lcouple, psi=psi_state(m.local, acts_local))
+    L = L_local + λ_global * L_global + λ_couple * Lcouple + L_time
+    return L, (; local=parts_local, global=parts_global, Lcouple, L_time=L_time, flow=flow, psi=psi_state(m.local, acts_local))
 end
 
 function cognitive_probe(; vocab::Int=16, d::Int=24, seq::Int=8, seed::Int=0,
@@ -1541,7 +1689,7 @@ function cognitive_probe(; vocab::Int=16, d::Int=24, seq::Int=8, seed::Int=0,
         global_K::Int=3, global_ds::Int=12, global_r::Int=16, global_λ_pair::T=0.5f0,
         λ_square::T=T(0.05), λ_neg::T=T(1e-3), λ_KL::T=T(1e-3), λ_rec::T=T(1e-2),
         λ_self::T=T(1e-2), λ_jnd::T=T(1e-3), λ_instab::T=T(0f0), ε_instab::T=T(1e-3), instab_samples::Int=1,
-        λ_struct::T=T(1e-3), λ_rules::T=T(1e-2), λ_mono::T=T(1e-3), λ_global::T=T(1f0), λ_couple::T=T(1e-3),
+        λ_struct::T=T(1e-3), λ_rules::T=T(1e-2), λ_mono::T=T(1e-3), λ_global::T=T(1f0), λ_couple::T=T(1e-3), λ_time::T=T(0f0),
         epsilons::AbstractVector{T}=T[1f-4, 5f-4, 1f-3, 5f-3], profile_width::Int=28,
         save_profile::Union{Nothing,AbstractString}=nothing, save_coupling::Union{Nothing,AbstractString}=nothing,
         visualize::Bool=true)
@@ -1581,17 +1729,21 @@ function cognitive_probe(; vocab::Int=16, d::Int=24, seq::Int=8, seed::Int=0,
         coupling = coupling_heat,
     )
 
+    dev_state = Archetypal.DevState()
     L, parts = lossfn(cog, tokens; λ_square=λ_square, λ_neg=λ_neg, λ_KL=λ_KL, λ_rec=λ_rec, λ_self=λ_self,
         λ_jnd=λ_jnd, λ_instab=λ_instab, ε_instab=ε_instab, instab_samples=instab_samples,
-        λ_struct=λ_struct, λ_rules=λ_rules, λ_mono=λ_mono, λ_global=λ_global, λ_couple=λ_couple)
+        λ_struct=λ_struct, λ_rules=λ_rules, λ_mono=λ_mono, λ_global=λ_global, λ_couple=λ_couple, λ_time=λ_time, dev_state=dev_state)
+
+    parts.flow !== nothing && Archetypal.update!(dev_state, parts.global; flow=parts.flow)
 
     if visualize
-        @info "cognitive bridge probe" L_total=L Lcouple=parts.Lcouple instab sweep spark coupling_spark coupling_heat coupling_path heatmaps
+        @info "cognitive bridge probe" L_total=L Lcouple=parts.Lcouple L_time=parts.L_time dev_state=dev_state instab sweep spark coupling_spark coupling_heat coupling_path heatmaps
     end
 
     return (; Ltotal=L, tokens, psi=parts.psi, Lcouple=parts.Lcouple,
             local=parts.local, global=parts.global, instab, sweep, spark,
-            coupling=(; coupling..., spark=coupling_spark, path=coupling_path), heatmaps)
+            coupling=(; coupling..., spark=coupling_spark, path=coupling_path), heatmaps,
+            L_time=parts.L_time, flow=parts.flow, dev_state=dev_state)
 end
 
 end # module
