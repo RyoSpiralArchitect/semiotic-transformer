@@ -10,6 +10,6 @@ Functors = "d9f16b24-f501-4c13-a1f2-28368ffc5196"
 
 [compat]
 julia = "1.9"
-Flux = "^0.14"
+Flux = "^0.16"
 NNlib = "^0.9"
 Functors = "^0.4"
