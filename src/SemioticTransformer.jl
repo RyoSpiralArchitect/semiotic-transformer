@@ -112,6 +112,80 @@ function potential_grad(mf::MeaningField, x::AbstractVector{T})
     return mf.scale .* g
 end
 
+function meaning_instability(mf::MeaningField, X::AbstractMatrix{T}; ε::T=T(1e-3), samples::Int=1)
+    d, n = size(X)
+    accum = zero(T)
+    @inbounds for _ in 1:samples
+        noise = ε .* randn(T, d, n)
+        for j in 1:n
+            x = view(X, :, j)
+            Δ = potential_grad(mf, x) .- potential_grad(mf, x .+ view(noise, :, j))
+            accum += sum(abs2, Δ)
+        end
+    end
+    return accum / (samples * n)
+end
+
+function meaning_instability(mf::MeaningField, X::AbstractArray{T,3}; ε::T=T(1e-3), samples::Int=1)
+    d, n, batches = size(X)
+    accum = zero(T)
+    @inbounds for _ in 1:samples
+        noise = ε .* randn(T, d, n, batches)
+        for b in 1:batches, j in 1:n
+            x = view(X, :, j, b)
+            Δ = potential_grad(mf, x) .- potential_grad(mf, x .+ view(noise, :, j, b))
+            accum += sum(abs2, Δ)
+        end
+    end
+    return accum / (samples * n * batches)
+end
+
+struct PsiState{TX,TΦ,TD}
+    X::TX
+    Φ::TΦ
+    diff::TD
+end
+
+psi_state(mf::MeaningField, df::DifferenceField, X) = PsiState(X, potential(mf, X), difference_matrix(df, X))
+psi_state(b::SemioticBlock, X) = psi_state(b.mf, b.df, X)
+psi_state(m::SemioticModel, X) = psi_state(m.blocks[end], X)
+
+function meaning_instability_profile(mf::MeaningField, X; epsilons::AbstractVector{T}=T[1f-4, 5f-4, 1f-3, 5f-3], samples::Int=4)
+    return [(ϵ, meaning_instability(mf, X; ε=ϵ, samples=samples)) for ϵ in epsilons]
+end
+
+function instability_sparkline(profile; width::Int=28)
+    isempty(profile) && return ""
+    vals = [p[2] for p in profile]
+    lo, hi = extrema(vals)
+    span = max(hi - lo, eps(T))
+    chars = collect("▁▂▃▄▅▆▇█")
+    step = max(1, ceil(Int, length(vals) / width))
+    io = IOBuffer()
+    @inbounds for idx in 1:step:length(vals)
+        v = vals[idx]
+        level = clamp(Int(floor((v - lo) / span * (length(chars) - 1))) + 1, 1, length(chars))
+        print(io, chars[level])
+    end
+    return String(take!(io))
+end
+
+function instability_profile_table(profile)
+    io = IOBuffer()
+    println(io, "epsilon,instability")
+    for (ϵ, val) in profile
+        println(io, "$(ϵ),$(val)")
+    end
+    return String(take!(io))
+end
+
+function save_instability_profile(path::AbstractString, profile)
+    open(path, "w") do io
+        println(io, instability_profile_table(profile))
+    end
+    return path
+end
+
 function update!(mf::MeaningField, X::AbstractMatrix{T}; τ=T(0.95), temp=T(1.0))
     d, n = size(X)
     k = size(mf.P, 2)
@@ -530,7 +604,8 @@ function (emb::Embedding)(tokens::AbstractMatrix{<:Integer})
     return reshape(X, d, seq_len, batches)
 end
 
-function SemioticModel(vocab::Int, d::Int; layers::Int=2, H::Int=3, k::Int=8, z::Int=div(d, 2), classes::Int=vocab, square=nothing, squares=nothing)
+function SemioticModel(emb::Embedding; layers::Int=2, H::Int=3, k::Int=8, z::Int=div(size(emb.weight, 1), 2), classes::Int=size(emb.weight, 2), square=nothing, squares=nothing)
+    d = size(emb.weight, 1)
     blocks = [SemioticBlock(d; z=z, H=H, k=k) for _ in 1:layers]
     sqs = SemioticSquare[]
     if squares !== nothing
@@ -538,25 +613,14 @@ function SemioticModel(vocab::Int, d::Int; layers::Int=2, H::Int=3, k::Int=8, z:
     elseif square !== nothing
         push!(sqs, square)
     end
-    SemioticModel(Flux.Embedding(vocab, d), blocks, LayerNorm(d), Dense(d, classes), sqs)
+    SemioticModel(emb, blocks, LayerNorm(d), Dense(d, classes), sqs)
 end
 
-function forward(m::SemioticModel, tokens::AbstractVector{<:Integer}; update_field=false, will=false)
-    X = m.emb(tokens)
-    total_KL = zero(T)
-    recL = zero(T)
-    for b in m.blocks
-        X, KL, rL = b(X; update_field=update_field, will=will)
-        total_KL += KL
-        recL += rL
-    end
-    X = _apply_layernorm(m.ln, X)
-    logits = m.proj(X)
-    return logits, total_KL, recL, X
+function SemioticModel(vocab::Int, d::Int; layers::Int=2, H::Int=3, k::Int=8, z::Int=div(d, 2), classes::Int=vocab, square=nothing, squares=nothing)
+    return SemioticModel(Flux.Embedding(vocab, d); layers=layers, H=H, k=k, z=z, classes=classes, square=square, squares=squares)
 end
 
-function forward(m::SemioticModel, tokens::AbstractMatrix{<:Integer}; update_field=false, will=false)
-    X = m.emb(tokens)
+function _forward_embedded(m::SemioticModel, X; update_field=false, will=false)
     total_KL = zero(T)
     recL = zero(T)
     for b in m.blocks
@@ -567,6 +631,19 @@ function forward(m::SemioticModel, tokens::AbstractMatrix{<:Integer}; update_fie
     X = _apply_layernorm(m.ln, X)
     logits = _apply_dense(m.proj, X)
     return logits, total_KL, recL, X
+end
+
+forward(m::SemioticModel, X::AbstractMatrix{T}; update_field=false, will=false) where {T} = _forward_embedded(m, X; update_field=update_field, will=will)
+forward(m::SemioticModel, X::AbstractArray{T,3}; update_field=false, will=false) where {T} = _forward_embedded(m, X; update_field=update_field, will=will)
+
+function forward(m::SemioticModel, tokens::AbstractVector{<:Integer}; update_field=false, will=false)
+    X = m.emb(tokens)
+    return _forward_embedded(m, X; update_field=update_field, will=will)
+end
+
+function forward(m::SemioticModel, tokens::AbstractMatrix{<:Integer}; update_field=false, will=false)
+    X = m.emb(tokens)
+    return _forward_embedded(m, X; update_field=update_field, will=will)
 end
 
 _apply_dense(layer::Dense, X::AbstractMatrix{T}) where {T} = layer(X)
@@ -639,28 +716,34 @@ function _negation_penalty(blocks::Vector{SemioticBlock}; kw...)
     return L
 end
 
-function lossfn(m::SemioticModel, tokens::AbstractVector{<:Integer}, targets::AbstractVector{<:Integer}; λ_square=T(0.05), λ_neg=T(1e-3), λ_KL=T(1e-3), λ_rec=T(1e-2), λ_self=T(1e-2), λ_jnd=T(1e-3), pad_token::Union{Nothing,Int}=nothing, update_field::Bool=false, will::Bool=true)
-    logits, KL, recL, X = forward(m, tokens; update_field=update_field, will=will)
+function _semiotic_loss_from_forward(m::SemioticModel, logits, X, targets; KL, recL, pad_token::Union{Nothing,Int}=nothing, λ_square=T(0.05), λ_neg=T(1e-3), λ_KL=T(1e-3), λ_rec=T(1e-2), λ_self=T(1e-2), λ_jnd=T(1e-3), λ_instab::T=T(0.0), ε_instab::T=T(1e-3), instab_samples::Int=1)
     Lce = _ce_loss(logits, targets; pad_token=pad_token)
     top_block = m.blocks[end]
     Lself = _self_loss_block(top_block, X)
     Lneg = _negation_penalty(m.blocks; λ_inv=T(1e-3), λ_iso=T(1e-3), λ_sym=T(1e-4))
     Lsq = square_penalty(m.emb.weight, m.squares)
     Ljnd = jnd_loss(top_block.df, X; k=T(0.08), θ=T(0.05))
-    L = Lce + λ_KL * KL + λ_rec * recL + λ_square * Lsq + λ_neg * Lneg + λ_self * Lself + λ_jnd * Ljnd
-    return L, (; Lce, KL, recL, Lsq, Lneg, Lself, Ljnd)
+    Linstab = iszero(λ_instab) ? zero(T) : meaning_instability(top_block.mf, X; ε=ε_instab, samples=instab_samples)
+    L = Lce + λ_KL * KL + λ_rec * recL + λ_square * Lsq + λ_neg * Lneg + λ_self * Lself + λ_jnd * Ljnd + λ_instab * Linstab
+    return L, (; Lce, KL, recL, Lsq, Lneg, Lself, Ljnd, Linstab)
 end
 
-function lossfn(m::SemioticModel, tokens::AbstractMatrix{<:Integer}, targets::AbstractMatrix{<:Integer}; λ_square=T(0.05), λ_neg=T(1e-3), λ_KL=T(1e-3), λ_rec=T(1e-2), λ_self=T(1e-2), λ_jnd=T(1e-3), pad_token::Union{Nothing,Int}=nothing, update_field::Bool=false, will::Bool=true)
-    logits, KL, recL, X = forward(m, tokens; update_field=update_field, will=will)
-    Lce = _ce_loss(logits, targets; pad_token=pad_token)
-    top_block = m.blocks[end]
-    Lself = _self_loss_block(top_block, X)
-    Lneg = _negation_penalty(m.blocks; λ_inv=T(1e-3), λ_iso=T(1e-3), λ_sym=T(1e-4))
-    Lsq = square_penalty(m.emb.weight, m.squares)
-    Ljnd = jnd_loss(top_block.df, X; k=T(0.08), θ=T(0.05))
-    L = Lce + λ_KL * KL + λ_rec * recL + λ_square * Lsq + λ_neg * Lneg + λ_self * Lself + λ_jnd * Ljnd
-    return L, (; Lce, KL, recL, Lsq, Lneg, Lself, Ljnd)
+function _semiotic_loss_embedded(m::SemioticModel, X, targets; update_field::Bool=false, will::Bool=true, pad_token::Union{Nothing,Int}=nothing, λ_square=T(0.05), λ_neg=T(1e-3), λ_KL=T(1e-3), λ_rec=T(1e-2), λ_self=T(1e-2), λ_jnd=T(1e-3), λ_instab::T=T(0.0), ε_instab::T=T(1e-3), instab_samples::Int=1)
+    logits, KL, recL, acts = forward(m, X; update_field=update_field, will=will)
+    L, parts = _semiotic_loss_from_forward(m, logits, acts, targets; KL=KL, recL=recL, pad_token=pad_token, λ_square=λ_square, λ_neg=λ_neg, λ_KL=λ_KL, λ_rec=λ_rec, λ_self=λ_self, λ_jnd=λ_jnd, λ_instab=λ_instab, ε_instab=ε_instab, instab_samples=instab_samples)
+    return L, parts, acts
+end
+
+function lossfn(m::SemioticModel, tokens::AbstractVector{<:Integer}, targets::AbstractVector{<:Integer}; λ_square=T(0.05), λ_neg=T(1e-3), λ_KL=T(1e-3), λ_rec=T(1e-2), λ_self=T(1e-2), λ_jnd=T(1e-3), λ_instab::T=T(0.0), ε_instab::T=T(1e-3), instab_samples::Int=1, pad_token::Union{Nothing,Int}=nothing, update_field::Bool=false, will::Bool=true)
+    X = m.emb(tokens)
+    L, parts, _ = _semiotic_loss_embedded(m, X, targets; update_field=update_field, will=will, pad_token=pad_token, λ_square=λ_square, λ_neg=λ_neg, λ_KL=λ_KL, λ_rec=λ_rec, λ_self=λ_self, λ_jnd=λ_jnd, λ_instab=λ_instab, ε_instab=ε_instab, instab_samples=instab_samples)
+    return L, parts
+end
+
+function lossfn(m::SemioticModel, tokens::AbstractMatrix{<:Integer}, targets::AbstractMatrix{<:Integer}; λ_square=T(0.05), λ_neg=T(1e-3), λ_KL=T(1e-3), λ_rec=T(1e-2), λ_self=T(1e-2), λ_jnd=T(1e-3), λ_instab::T=T(0.0), ε_instab::T=T(1e-3), instab_samples::Int=1, pad_token::Union{Nothing,Int}=nothing, update_field::Bool=false, will::Bool=true)
+    X = m.emb(tokens)
+    L, parts, _ = _semiotic_loss_embedded(m, X, targets; update_field=update_field, will=will, pad_token=pad_token, λ_square=λ_square, λ_neg=λ_neg, λ_KL=λ_KL, λ_rec=λ_rec, λ_self=λ_self, λ_jnd=λ_jnd, λ_instab=λ_instab, ε_instab=ε_instab, instab_samples=instab_samples)
+    return L, parts
 end
 
 function lossfn(m::SemioticModel, sequence::AbstractVector{<:Integer}; kwargs...)
@@ -676,6 +759,24 @@ end
 # -----------------------------
 # Toy usage
 # -----------------------------
+_heat_levels() = collect(" ▁▂▃▄▅▆▇█")
+
+function ascii_heatmap(M::AbstractMatrix{<:Real}; levels=_heat_levels())
+    isempty(M) && return ""
+    lo, hi = extrema(M)
+    span = hi - lo
+    chars = IOBuffer()
+    nlevels = length(levels)
+    for i in 1:size(M, 1)
+        for j in 1:size(M, 2)
+            idx = span == 0 ? nlevels : clamp(Int(floor((M[i, j] - lo) / span * (nlevels - 1))) + 1, 1, nlevels)
+            print(chars, levels[idx])
+        end
+        i < size(M, 1) && print(chars, '\n')
+    end
+    return String(take!(chars))
+end
+
 function toy_train(; seed=7)
     Random.seed!(seed)
     vocab = 8; d = 64
@@ -692,13 +793,53 @@ function toy_train(; seed=7)
             L
         end
         Flux.update!(opt, Flux.params(m), gs)
-        _ = forward(m, tokens; update_field=true, will=true)
+        _, _, _, acts = forward(m, tokens; update_field=true, will=true)
         if step % 10 == 0
             L, parts = lossfn(m, tokens, targets; λ_square=0.05f0, λ_neg=0.01f0)
-            @info "step=$step" loss=L parts
+            instab = meaning_instability(m.blocks[end].mf, acts; ε=5f-4, samples=4)
+            @info "step=$step" loss=L instab parts
         end
     end
     return m
+end
+
+function instability_probe(; seed=2027, ε=5f-4, samples::Int=4, λ_instab=T(1f-2), epsilons::AbstractVector{T}=T[1f-4, 5f-4, 1f-3, 5f-3], visualize::Bool=true, save_profile::Union{Nothing,AbstractString}=nothing)
+    Random.seed!(seed)
+    vocab = 8; d = 64
+    sq = SemioticSquare(1, 2, 3, 4)
+    m = SemioticModel(vocab, d; layers=2, H=3, k=8, z=32, square=sq)
+
+    tokens  = [1, 2, 5, 6, 7, 3, 4, 2]
+    targets = [2, 1, 5, 6, 7, 4, 3, 1]
+
+    logits, KL, recL, acts = forward(m, tokens; update_field=true, will=true)
+    mf = m.blocks[end].mf
+    df = m.blocks[end].df
+
+    instab = meaning_instability(mf, acts; ε=ε, samples=samples)
+    sweep = meaning_instability_profile(mf, acts; epsilons=epsilons, samples=samples)
+    spark = instability_sparkline(sweep)
+    isnothing(save_profile) || save_instability_profile(save_profile, sweep)
+
+    loss, parts = lossfn(m, tokens, targets;
+        λ_square=0.05f0, λ_neg=0.01f0, λ_instab=λ_instab,
+        ε_instab=ε, instab_samples=samples)
+
+    potentials = potential(mf, acts)
+    diffmap = difference_matrix(df, acts)
+    grad_norms = [norm(potential_grad(mf, view(acts, :, j))) for j in 1:size(acts, 2)]
+
+    heatmaps = (
+        potential = ascii_heatmap(reshape(potentials, 1, :)),
+        difference = ascii_heatmap(diffmap),
+        grad_norms = ascii_heatmap(reshape(grad_norms, 1, :))
+    )
+
+    if visualize
+        @info "meaning-instability probe" instab sweep spark save_profile loss parts heatmaps
+    end
+
+    return (; instab, loss, parts, logits, KL, recL, sweep, spark, potentials, diffmap, grad_norms, heatmaps)
 end
 
 # =============================
@@ -708,9 +849,100 @@ module Archetypal
 
 using Flux, LinearAlgebra, Random, NNlib, Functors
 import ..SemioticTransformer
-using ..SemioticTransformer: T, Negation, negation_penalty, DifferenceField, difference_matrix,
-    MeaningField, potential, potential_grad, update!, MeaningChainLayer, SelfField, coniunctio,
-    _apply_layernorm, _apply_dense, next_token_pairs, _ce_loss
+    using ..SemioticTransformer: T, Negation, negation_penalty, DifferenceField, difference_matrix,
+        MeaningField, potential, potential_grad, update!, MeaningChainLayer, SelfField, coniunctio,
+        _apply_layernorm, _apply_dense, next_token_pairs, _ce_loss
+
+    struct DevState
+        m::Float32
+        s::Float32
+    end
+
+    DevState(; m=0.1f0, s=0.0f0) = DevState(Float32(m), Float32(s))
+
+    entropy(w::AbstractVector{T}) where {T} = -sum(p -> p > eps(T) ? p * log(p) : zero(T), w)
+
+    function flow_metrics(W::AbstractMatrix{T}) where {T}
+        K, n = size(W)
+        H_start = entropy(view(W, :, 1))
+        H_end = entropy(view(W, :, n))
+
+        H_mean = zero(T)
+        @inbounds @views for t in 1:n
+            H_mean += entropy(view(W, :, t))
+        end
+        H_mean /= n
+
+        conflict_ps = (K >= 3) ? mean(W[2, :] .* W[3, :]) : zero(T)
+        conflict_aa = (K >= 5) ? mean(W[4, :] .* W[5, :]) : zero(T)
+
+        return (H_start=H_start, H_end=H_end, H_mean=H_mean, conflict=conflict_ps + conflict_aa)
+    end
+
+    function _getprop(parts, name::Symbol, default)
+        return name in propertynames(parts) ? getproperty(parts, name) : default
+    end
+
+    function update!(st::DevState, parts; flow=nothing, η_m=0.03f0, η_s=0.08f0)
+        base_stress = clamp(_getprop(parts, :Lce, 0f0) / 5f0, 0f0, 1f0)
+        conflict = flow === nothing ? 0f0 : flow.conflict
+        st.s = clamp(st.s + η_s * (0.6f0 * base_stress + 0.4f0 * conflict - 0.3f0 * st.s), 0f0, 1f0)
+
+        lind = _getprop(parts, :Lind, _getprop(parts, :Lstruct, 0f0))
+        integ = exp(-lind)
+        reg = st.s
+        st.m = clamp(st.m + η_m * (0.7f0 * integ - 0.5f0 * reg), 0f0, 1f0)
+
+        return st
+    end
+
+    function time_dynamics_loss(block::ArchetypalBlock,
+            Y::AbstractMatrix{T},
+            W::AbstractMatrix{T},
+            dev::DevState;
+            λ_time::T=T(1e-2)) where {T}
+
+        K, n = size(W)
+        fm = flow_metrics(W)
+
+        ΔH = fm.H_end - fm.H_start
+        L_dir = dev.m * NNlib.relu(ΔH)^2
+
+        L_self = zero(T)
+        if K >= 1 && n >= 2
+            s_first = mean(W[1, 1:clamp(div(n, 3), 1, n)])
+            s_last = mean(W[1, max(1, n - div(n, 3)):n])
+            target = dev.m * T(0.5)
+            L_self = ((s_last - s_first) - target)^2
+        end
+
+        L_smooth = zero(T)
+        @inbounds @views for t in 1:n-1
+            dt = view(W, :, t + 1) .- view(W, :, t)
+            L_smooth += mean(abs2, dt)
+        end
+        L_smooth /= max(T(n - 1), T(1))
+        L_smooth_scaled = (0.3f0 + 0.7f0 * dev.m) * L_smooth
+
+        L_reg = zero(T)
+        if K >= 3 && n >= 3
+            from = max(2, n - div(n, 3))
+            @inbounds @views for t in from:(n - 1)
+                s_now = W[1, t]
+                s_next = W[1, t + 1]
+                sh_now = W[3, t]
+                sh_next = W[3, t + 1]
+                drop_self = NNlib.relu(s_now - s_next)
+                rise_shadow = NNlib.relu(sh_next - sh_now)
+                L_reg += drop_self * rise_shadow
+            end
+            L_reg /= max(T(n - from), T(1))
+        end
+        L_reg_scaled = dev.m * L_reg
+
+        L = L_dir + L_self + L_smooth_scaled + L_reg_scaled
+        return λ_time * L, fm
+    end
 
 struct Obj
     d::Int
@@ -1142,30 +1374,39 @@ struct ArchetypalModel
 end
 @functor ArchetypalModel
 
-function ArchetypalModel(vocab::Int, d::Int; K::Int=6, ds::Int=div(d, 2), r::Int=32, λ_pair::T=0.5f0, classes::Int=vocab,
-        allowed_pairs::Union{Nothing,Vector{Tuple{Int,Int}}}=nothing)
+function ArchetypalModel(emb::Embedding; K::Int=6, ds::Int=div(size(emb.weight, 1), 2), r::Int=32, λ_pair::T=0.5f0, classes::Int=size(emb.weight, 2), allowed_pairs::Union{Nothing,Vector{Tuple{Int,Int}}}=nothing)
+    d = size(emb.weight, 1)
     ArchetypalModel(
-        Flux.Embedding(vocab, d),
+        emb,
         ArchetypalBlock(d; K=K, ds=ds, r=r, λ_pair=λ_pair, allowed_pairs=allowed_pairs),
         Flux.LayerNorm(d),
         Dense(d, classes),
     )
 end
 
-function forward(m::ArchetypalModel, tokens::AbstractVector{<:Integer}; update_fields::Bool=false, will::Bool=true)
-    X = m.emb(tokens)
-    Y, W, cache = m.block(X; will=will, update_fields=update_fields)
-    Y = _apply_layernorm(m.ln, Y)
-    logits = m.proj(Y)
-    return logits, Y, W, cache
+function ArchetypalModel(vocab::Int, d::Int; K::Int=6, ds::Int=div(d, 2), r::Int=32, λ_pair::T=0.5f0, classes::Int=vocab,
+        allowed_pairs::Union{Nothing,Vector{Tuple{Int,Int}}}=nothing)
+    ArchetypalModel(Flux.Embedding(vocab, d); K=K, ds=ds, r=r, λ_pair=λ_pair, classes=classes, allowed_pairs=allowed_pairs)
 end
 
-function forward(m::ArchetypalModel, tokens::AbstractMatrix{<:Integer}; update_fields::Bool=false, will::Bool=true)
-    X = m.emb(tokens)
+function _forward_embedded(m::ArchetypalModel, X; update_fields::Bool=false, will::Bool=true)
     Y, W, cache = m.block(X; will=will, update_fields=update_fields)
     Y = _apply_layernorm(m.ln, Y)
     logits = _apply_dense(m.proj, Y)
     return logits, Y, W, cache
+end
+
+forward(m::ArchetypalModel, X::AbstractMatrix{T}; update_fields::Bool=false, will::Bool=true) where {T} = _forward_embedded(m, X; update_fields=update_fields, will=will)
+forward(m::ArchetypalModel, X::AbstractArray{T,3}; update_fields::Bool=false, will::Bool=true) where {T} = _forward_embedded(m, X; update_fields=update_fields, will=will)
+
+function forward(m::ArchetypalModel, tokens::AbstractVector{<:Integer}; update_fields::Bool=false, will::Bool=true)
+    X = m.emb(tokens)
+    return _forward_embedded(m, X; update_fields=update_fields, will=will)
+end
+
+function forward(m::ArchetypalModel, tokens::AbstractMatrix{<:Integer}; update_fields::Bool=false, will::Bool=true)
+    X = m.emb(tokens)
+    return _forward_embedded(m, X; update_fields=update_fields, will=will)
 end
 
 function structure_penalty(ab::ArchetypalBlock)
@@ -1182,6 +1423,21 @@ function structure_penalty(ab::ArchetypalBlock)
     L
 end
 
+function _archetypal_loss_from_forward(m::ArchetypalModel, logits, Y, locals, targets; pad_token::Union{Nothing,Int}=nothing, λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3), λ_mono=T(1e-3))
+    Lce = _ce_loss(logits, targets; pad_token=pad_token)
+    Lstruct = structure_penalty(m.block)
+    Lrules = archetype_rules_loss(m.block)
+    Ljnd = jnd_loss(m.block.df_global, Y)
+    Lmono = monoid_penalty(m.block.monoid, locals)
+    L = Lce + λ_struct * Lstruct + λ_rules * Lrules + λ_jnd * Ljnd + λ_mono * Lmono
+    return L, (; Lce, Lstruct, Lrules, Ljnd, Lmono)
+end
+
+function _archetypal_loss_embedded(m::ArchetypalModel, X, targets; pad_token::Union{Nothing,Int}=nothing, λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3), λ_mono=T(1e-3), update_fields::Bool=false, will::Bool=true)
+    logits, Y, _, cache = forward(m, X; update_fields=update_fields, will=will)
+    return _archetypal_loss_from_forward(m, logits, Y, cache.locals, targets; pad_token=pad_token, λ_struct=λ_struct, λ_rules=λ_rules, λ_jnd=λ_jnd, λ_mono=λ_mono)
+end
+
 function lossfn(m::ArchetypalModel, tokens::AbstractVector{<:Integer}; pad_token::Union{Nothing,Int}=nothing,
         λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3), λ_mono=T(1e-3), update_fields::Bool=false, will::Bool=true)
     context, targets = next_token_pairs(tokens)
@@ -1196,36 +1452,70 @@ function lossfn(m::ArchetypalModel, tokens::AbstractMatrix{<:Integer}; pad_token
         λ_mono=λ_mono, update_fields=update_fields, will=will)
 end
 
-function lossfn(m::ArchetypalModel, tokens::AbstractVector{<:Integer}, targets::AbstractVector{<:Integer};
+    function lossfn(m::ArchetypalModel, tokens::AbstractVector{<:Integer}, targets::AbstractVector{<:Integer};
         pad_token::Union{Nothing,Int}=nothing, λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3), λ_mono=T(1e-3),
         update_fields::Bool=false, will::Bool=true)
-    logits, Y, _, cache = forward(m, tokens; update_fields=update_fields, will=will)
-    Lce = _ce_loss(logits, targets; pad_token=pad_token)
-    Lstruct = structure_penalty(m.block)
-    Lrules = archetype_rules_loss(m.block)
-    Ljnd = jnd_loss(m.block.df_global, Y)
-    Lmono = monoid_penalty(m.block.monoid, cache.locals)
-    L = Lce + λ_struct * Lstruct + λ_rules * Lrules + λ_jnd * Ljnd + λ_mono * Lmono
-    return L, (; Lce, Lstruct, Lrules, Ljnd, Lmono)
-end
+        X = m.emb(tokens)
+        return _archetypal_loss_embedded(m, X, targets; pad_token=pad_token, λ_struct=λ_struct, λ_rules=λ_rules, λ_jnd=λ_jnd, λ_mono=λ_mono, update_fields=update_fields, will=will)
+    end
 
-function lossfn(m::ArchetypalModel, tokens::AbstractMatrix{<:Integer}, targets::AbstractMatrix{<:Integer};
+    function lossfn(m::ArchetypalModel, tokens::AbstractMatrix{<:Integer}, targets::AbstractMatrix{<:Integer};
         pad_token::Union{Nothing,Int}=nothing, λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3), λ_mono=T(1e-3),
         update_fields::Bool=false, will::Bool=true)
-    logits, Y, _, cache = forward(m, tokens; update_fields=update_fields, will=will)
-    Lce = _ce_loss(logits, targets; pad_token=pad_token)
-    Lstruct = structure_penalty(m.block)
-    Lrules = archetype_rules_loss(m.block)
-    Ljnd = jnd_loss(m.block.df_global, Y)
-    Lmono = monoid_penalty(m.block.monoid, cache.locals)
-    L = Lce + λ_struct * Lstruct + λ_rules * Lrules + λ_jnd * Ljnd + λ_mono * Lmono
-    return L, (; Lce, Lstruct, Lrules, Ljnd, Lmono)
-end
+        X = m.emb(tokens)
+        return _archetypal_loss_embedded(m, X, targets; pad_token=pad_token, λ_struct=λ_struct, λ_rules=λ_rules, λ_jnd=λ_jnd, λ_mono=λ_mono, update_fields=update_fields, will=will)
+    end
 
-function toy_train(; seed=2025)
-    Random.seed!(seed)
-    vocab = 12
-    d = 64
+    base_loss(args...; kwargs...) = lossfn(args...; kwargs...)
+
+    function total_loss(m::ArchetypalModel, tokens::AbstractVector{<:Integer}, targets::AbstractVector{<:Integer}, dev::DevState;
+            pad_token::Union{Nothing,Int}=nothing, λ_struct=T(1e-3), λ_rules=T(1e-2), λ_jnd=T(1e-3), λ_mono=T(1e-3),
+            λ_time::T=T(1e-2), update_fields::Bool=false, will::Bool=true)
+
+        logits, Y, W, cache = forward(m, tokens; update_fields=update_fields, will=will)
+        L_struct, parts_struct = _archetypal_loss_from_forward(m, logits, Y, cache.locals, targets;
+            pad_token=pad_token, λ_struct=λ_struct, λ_rules=λ_rules, λ_jnd=λ_jnd, λ_mono=λ_mono)
+
+        L_time, flow = time_dynamics_loss(m.block, Y, W, dev; λ_time=λ_time)
+        L_total = L_struct + L_time
+        return L_total, (parts=parts_struct, flow=flow, L_struct=L_struct, L_time=L_time)
+    end
+
+    function devstate_trace_row(step::Integer, L_total, info, dev::DevState)
+        return (
+            step=Int(step),
+            L_total=L_total,
+            L_struct=info.L_struct,
+            L_time=info.L_time,
+            m=dev.m,
+            s=dev.s,
+            H_start=info.flow.H_start,
+            H_end=info.flow.H_end,
+            H_mean=info.flow.H_mean,
+            conflict=info.flow.conflict,
+        )
+    end
+
+    function devstate_trace_table(trace)
+        io = IOBuffer()
+        println(io, "step,L_total,L_struct,L_time,m,s,H_start,H_end,H_mean,conflict")
+        for row in trace
+            println(io, "$(row.step),$(row.L_total),$(row.L_struct),$(row.L_time),$(row.m),$(row.s),$(row.H_start),$(row.H_end),$(row.H_mean),$(row.conflict)")
+        end
+        return String(take!(io))
+    end
+
+    function save_devstate_trace(path::AbstractString, trace)
+        open(path, "w") do io
+            println(io, devstate_trace_table(trace))
+        end
+        return path
+    end
+
+    function toy_train(; seed=2025)
+        Random.seed!(seed)
+        vocab = 12
+        d = 64
     K = 6
     ds = 32
     r = 32
@@ -1250,8 +1540,365 @@ function toy_train(; seed=2025)
         end
     end
     m
-end
+    end
+
+    function train_with_time(; seed=2025, steps=200, λ_time=T(1e-2), trace::Bool=false, save_trace::Union{Nothing,String}=nothing)
+        Random.seed!(seed)
+        vocab = 12
+        d = 64
+        K = 6
+        ds = 32
+        r = 32
+        m = ArchetypalModel(vocab, d; K=K, ds=ds, r=r)
+
+        tokens = [1, 2, 5, 6, 7, 3, 4, 2, 9, 10]
+        targets = [2, 1, 5, 6, 7, 4, 3, 1, 10, 9]
+
+        opt = Flux.setup(Flux.Optimisers.Adam(1e-3), m)
+        dev = DevState()
+        logs = trace ? Any[] : nothing
+
+        for step in 1:steps
+            _ = Float32(step / steps)
+
+            gs = Flux.gradient(Flux.params(m)) do
+                L, _ = total_loss(m, tokens, targets, dev; λ_time=λ_time)
+                L
+            end
+            Flux.update!(opt, Flux.params(m), gs)
+
+            Ltot, info = total_loss(m, tokens, targets, dev; λ_time=λ_time)
+            update!(dev, info.parts; flow=info.flow)
+
+            if trace
+                push!(logs, devstate_trace_row(step, Ltot, info, dev))
+            end
+
+            if step % 20 == 0
+                @info "step=$step" L=Ltot dev=dev flow=info.flow parts=info.parts
+            end
+        end
+
+        if trace
+            save_trace === nothing || save_devstate_trace(save_trace, logs)
+            return m, dev, logs
+        end
+
+        return m, dev
+    end
 
 end # module Archetypal
 
+# =============================
+# Cognitive bridge (shared embedding)
+# =============================
+
+struct CognitiveModel
+    emb::Embedding
+    local::SemioticModel
+    global::Archetypal.ArchetypalModel
+end
+@functor CognitiveModel
+
+function CognitiveModel(emb::Embedding; classes::Int=size(emb.weight, 2),
+        local_layers::Int=2, local_H::Int=3, local_k::Int=8, local_z::Int=div(size(emb.weight, 1), 2), local_square=nothing, local_squares=nothing,
+        global_K::Int=6, global_ds::Int=div(size(emb.weight, 1), 2), global_r::Int=32, global_λ_pair::T=0.5f0, allowed_pairs::Union{Nothing,Vector{Tuple{Int,Int}}}=nothing)
+    local = SemioticModel(emb; layers=local_layers, H=local_H, k=local_k, z=local_z, classes=classes, square=local_square, squares=local_squares)
+    global = Archetypal.ArchetypalModel(emb; K=global_K, ds=global_ds, r=global_r, λ_pair=global_λ_pair, classes=classes, allowed_pairs=allowed_pairs)
+    CognitiveModel(emb, local, global)
+end
+
+function CognitiveModel(vocab::Int, d::Int; classes::Int=vocab, kw...)
+    emb = Flux.Embedding(vocab, d)
+    return CognitiveModel(emb; classes=classes, kw...)
+end
+
+function coupling_penalty(local::SemioticModel, global::Archetypal.ArchetypalModel; max_pairs::Int=typemax(Int))
+    P = local.blocks[end].mf.P
+    centers = [center_global(u) for u in global.block.units]
+    K = min(size(P, 2), length(centers), max_pairs)
+    K == 0 && return zero(T)
+    acc = zero(T)
+    @inbounds for i in 1:K
+        acc += norm(view(P, :, i) .- centers[i])^2
+    end
+    return acc / K
+end
+
+function coupling_matrix(local::SemioticModel, global::Archetypal.ArchetypalModel)
+    P = local.blocks[end].mf.P
+    centers = [center_global(u) for u in global.block.units]
+    ncenters = length(centers)
+    nproto = size(P, 2)
+    (ncenters == 0 || nproto == 0) && return zeros(T, ncenters, nproto)
+    M = zeros(T, ncenters, nproto)
+    @inbounds for i in 1:ncenters
+        ci = centers[i]
+        for j in 1:nproto
+            M[i, j] = norm(view(P, :, j) .- ci)
+        end
+    end
+    return M
+end
+
+function coupling_profile(local::SemioticModel, global::Archetypal.ArchetypalModel)
+    M = coupling_matrix(local, global)
+    proto_min = size(M, 2) == 0 ? T[] : vec(mapslices(minimum, M; dims=1))
+    center_min = size(M, 1) == 0 ? T[] : vec(mapslices(minimum, M; dims=2))
+    return (; matrix=M, proto_min, center_min)
+end
+
+function coupling_sparkline(distances; width::Int=28)
+    profile = [(T(i), d) for (i, d) in enumerate(distances)]
+    return instability_sparkline(profile; width=width)
+end
+
+function save_coupling_matrix(path::AbstractString, M)
+    open(path, "w") do io
+        print(io, "center/proto")
+        for j in 1:size(M, 2)
+            print(io, ",p$j")
+        end
+        println(io)
+        for i in 1:size(M, 1)
+            print(io, "c$i")
+            for j in 1:size(M, 2)
+                print(io, ",", M[i, j])
+            end
+            println(io)
+        end
+    end
+    return path
+end
+
+function forward(m::CognitiveModel, X; update_fields::Bool=false, will_local::Bool=true, will_global::Bool=true)
+    local_logits, KL, recL, acts_local = forward(m.local, X; update_field=update_fields, will=will_local)
+    global_logits, acts_global, W, cache_global = forward(m.global, X; update_fields=update_fields, will=will_global)
+    return (
+        local = (; logits=local_logits, KL=KL, recL=recL, acts=acts_local),
+        global = (; logits=global_logits, acts=acts_global, weights=W, cache=cache_global),
+        psi = psi_state(m.local, acts_local),
+    )
+end
+
+function forward(m::CognitiveModel, tokens::AbstractVector{<:Integer}; update_fields::Bool=false, will_local::Bool=true, will_global::Bool=true)
+    X = m.emb(tokens)
+    return forward(m, X; update_fields=update_fields, will_local=will_local, will_global=will_global)
+end
+
+function forward(m::CognitiveModel, tokens::AbstractMatrix{<:Integer}; update_fields::Bool=false, will_local::Bool=true, will_global::Bool=true)
+    X = m.emb(tokens)
+    return forward(m, X; update_fields=update_fields, will_local=will_local, will_global=will_global)
+end
+
+function lossfn(m::CognitiveModel, tokens::AbstractVector{<:Integer}; kwargs...)
+    context, targets = next_token_pairs(tokens)
+    return lossfn(m, context, targets; kwargs...)
+end
+
+function lossfn(m::CognitiveModel, tokens::AbstractMatrix{<:Integer}; kwargs...)
+    context, targets = next_token_pairs(tokens)
+    return lossfn(m, context, targets; kwargs...)
+end
+
+function lossfn(m::CognitiveModel, tokens, targets; pad_token::Union{Nothing,Int}=nothing,
+        λ_square::T=T(0.05), λ_neg::T=T(1e-3), λ_KL::T=T(1e-3), λ_rec::T=T(1e-2), λ_self::T=T(1e-2), λ_jnd::T=T(1e-3),
+        λ_instab::T=T(0.0), ε_instab::T=T(1e-3), instab_samples::Int=1,
+        λ_struct::T=T(1e-3), λ_rules::T=T(1e-2), λ_mono::T=T(1e-3), λ_global::T=T(1f0),
+        λ_couple::T=T(1e-3), λ_time::T=T(0f0), dev_state::Union{Nothing,Archetypal.DevState}=nothing,
+        update_fields::Bool=false, will_local::Bool=true, will_global::Bool=true)
+    X = m.emb(tokens)
+    local_logits, KL, recL, acts_local = forward(m.local, X; update_field=update_fields, will=will_local)
+    L_local, parts_local = _semiotic_loss_from_forward(m.local, local_logits, acts_local, targets; KL=KL, recL=recL, pad_token=pad_token, λ_square=λ_square, λ_neg=λ_neg, λ_KL=λ_KL, λ_rec=λ_rec, λ_self=λ_self, λ_jnd=λ_jnd, λ_instab=λ_instab, ε_instab=ε_instab, instab_samples=instab_samples)
+
+    global_logits, acts_global, W, cache_global = forward(m.global, X; update_fields=update_fields, will=will_global)
+    L_global, parts_global = _archetypal_loss_from_forward(m.global, global_logits, acts_global, cache_global.locals, targets; pad_token=pad_token, λ_struct=λ_struct, λ_rules=λ_rules, λ_jnd=λ_jnd, λ_mono=λ_mono)
+
+    L_time = zero(T)
+    flow = nothing
+    if dev_state !== nothing && λ_time != 0
+        L_time, flow = Archetypal.time_dynamics_loss(m.global.block, acts_global, W, dev_state; λ_time=λ_time)
+    end
+
+    Lcouple = coupling_penalty(m.local, m.global)
+    L = L_local + λ_global * L_global + λ_couple * Lcouple + L_time
+    return L, (; local=parts_local, global=parts_global, Lcouple, L_time=L_time, flow=flow, psi=psi_state(m.local, acts_local))
+end
+
+function cognitive_probe(; vocab::Int=16, d::Int=24, seq::Int=8, seed::Int=0,
+        local_layers::Int=1, local_H::Int=3, local_k::Int=4, local_z::Int=12,
+        global_K::Int=3, global_ds::Int=12, global_r::Int=16, global_λ_pair::T=0.5f0,
+        λ_square::T=T(0.05), λ_neg::T=T(1e-3), λ_KL::T=T(1e-3), λ_rec::T=T(1e-2),
+        λ_self::T=T(1e-2), λ_jnd::T=T(1e-3), λ_instab::T=T(0f0), ε_instab::T=T(1e-3), instab_samples::Int=1,
+        λ_struct::T=T(1e-3), λ_rules::T=T(1e-2), λ_mono::T=T(1e-3), λ_global::T=T(1f0), λ_couple::T=T(1e-3), λ_time::T=T(0f0),
+        epsilons::AbstractVector{T}=T[1f-4, 5f-4, 1f-3, 5f-3], profile_width::Int=28,
+        save_profile::Union{Nothing,AbstractString}=nothing, save_coupling::Union{Nothing,AbstractString}=nothing,
+        visualize::Bool=true)
+    seed >= 0 && Random.seed!(seed)
+    tokens = rand(1:vocab, seq)
+    emb = Flux.Embedding(vocab, d)
+    cog = CognitiveModel(emb; classes=vocab, local_layers=local_layers, local_H=local_H, local_k=local_k, local_z=local_z,
+        global_K=global_K, global_ds=global_ds, global_r=global_r, global_λ_pair=global_λ_pair)
+
+    # Grab ψ snapshot from a forward pass for diagnostics before computing losses
+    forward_out = forward(cog, tokens; update_fields=true)
+    psi = forward_out.psi
+    mf = cog.local.blocks[end].mf
+    df = cog.local.blocks[end].df
+
+    instab = meaning_instability(mf, psi.X; ε=ε_instab, samples=instab_samples)
+    sweep = meaning_instability_profile(mf, psi.X; epsilons=epsilons, samples=instab_samples)
+    spark = instability_sparkline(sweep; width=profile_width)
+    isnothing(save_profile) || save_instability_profile(save_profile, sweep)
+
+    coupling = coupling_profile(cog.local, cog.global)
+    coupling_spark = coupling_sparkline(coupling.proto_min; width=profile_width)
+    coupling_heat = ascii_heatmap(coupling.matrix)
+    coupling_path = save_coupling
+    if save_profile isa AbstractString
+        base = splitext(save_profile)
+        coupling_path = isnothing(coupling_path) ? base[1] * "_coupling" * base[2] : coupling_path
+    end
+    coupling_path isa AbstractString && save_coupling_matrix(coupling_path, coupling.matrix)
+
+    potentials = potential(mf, psi.X)
+    grad_norms = [norm(potential_grad(mf, view(psi.X, :, j))) for j in 1:size(psi.X, 2)]
+    heatmaps = (
+        potential = ascii_heatmap(reshape(potentials, 1, :)),
+        difference = ascii_heatmap(df isa DifferenceField ? difference_matrix(df, psi.X) : psi.diff),
+        grad_norms = ascii_heatmap(reshape(grad_norms, 1, :)),
+        coupling = coupling_heat,
+    )
+
+    dev_state = Archetypal.DevState()
+    L, parts = lossfn(cog, tokens; λ_square=λ_square, λ_neg=λ_neg, λ_KL=λ_KL, λ_rec=λ_rec, λ_self=λ_self,
+        λ_jnd=λ_jnd, λ_instab=λ_instab, ε_instab=ε_instab, instab_samples=instab_samples,
+        λ_struct=λ_struct, λ_rules=λ_rules, λ_mono=λ_mono, λ_global=λ_global, λ_couple=λ_couple, λ_time=λ_time, dev_state=dev_state)
+
+    parts.flow !== nothing && Archetypal.update!(dev_state, parts.global; flow=parts.flow)
+
+    if visualize
+        @info "cognitive bridge probe" L_total=L Lcouple=parts.Lcouple L_time=parts.L_time dev_state=dev_state instab sweep spark coupling_spark coupling_heat coupling_path heatmaps
+    end
+
+    return (; Ltotal=L, tokens, psi=parts.psi, Lcouple=parts.Lcouple,
+            local=parts.local, global=parts.global, instab, sweep, spark,
+            coupling=(; coupling..., spark=coupling_spark, path=coupling_path), heatmaps,
+            L_time=parts.L_time, flow=parts.flow, dev_state=dev_state)
+end
+
+function _flowval(flow, field::Symbol)
+    flow === nothing && return T(NaN)
+    return getproperty(flow, field)
+end
+
+function cognitive_trace(; vocab::Int=16, d::Int=24, seq::Int=8, steps::Int=16, seed::Int=0,
+        local_layers::Int=1, local_H::Int=3, local_k::Int=4, local_z::Int=12,
+        global_K::Int=3, global_ds::Int=12, global_r::Int=16, global_λ_pair::T=0.5f0,
+        λ_square::T=T(0.05), λ_neg::T=T(1e-3), λ_KL::T=T(1e-3), λ_rec::T=T(1e-2),
+        λ_self::T=T(1e-2), λ_jnd::T=T(1e-3), λ_instab::T=T(0f0), ε_instab::T=T(1e-3), instab_samples::Int=1,
+        λ_struct::T=T(1e-3), λ_rules::T=T(1e-2), λ_mono::T=T(1e-3), λ_global::T=T(1f0), λ_couple::T=T(1e-3), λ_time::T=T(0f0),
+        epsilons::AbstractVector{T}=T[1f-4, 5f-4, 1f-3, 5f-3], profile_width::Int=28,
+        save_profile::Union{Nothing,AbstractString}=nothing, save_coupling::Union{Nothing,AbstractString}=nothing,
+        save_trace::Union{Nothing,AbstractString}=nothing, visualize::Bool=true)
+    seed >= 0 && Random.seed!(seed)
+
+    emb = Flux.Embedding(vocab, d)
+    cog = CognitiveModel(emb; classes=vocab, local_layers=local_layers, local_H=local_H, local_k=local_k, local_z=local_z,
+        global_K=global_K, global_ds=global_ds, global_r=global_r, global_λ_pair=global_λ_pair)
+
+    dev_state = Archetypal.DevState()
+    rows = Vector{NamedTuple{(:step, :L_total, :Lcouple, :L_time, :m, :s, :instab, :H_start, :H_end, :H_mean, :conflict),
+        Tuple{Int, T, T, T, Float32, Float32, T, T, T, T, T}}}()
+
+    last_tokens = nothing
+    last_psi = nothing
+    last_sweep = nothing
+    last_spark = ""
+    last_coupling = nothing
+    coupling_path = save_coupling
+    profile_path = save_profile
+
+    for step in 1:steps
+        tokens = rand(1:vocab, seq)
+        forward_out = forward(cog, tokens; update_fields=true)
+        psi = forward_out.psi
+        mf = cog.local.blocks[end].mf
+
+        instab = meaning_instability(mf, psi.X; ε=ε_instab, samples=instab_samples)
+        sweep = meaning_instability_profile(mf, psi.X; epsilons=epsilons, samples=instab_samples)
+        spark = instability_sparkline(sweep; width=profile_width)
+        isnothing(profile_path) || save_instability_profile(profile_path, sweep)
+
+        coupling = coupling_profile(cog.local, cog.global)
+        coupling_spark = coupling_sparkline(coupling.proto_min; width=profile_width)
+        coupling_heat = ascii_heatmap(coupling.matrix)
+        if profile_path isa AbstractString
+            base = splitext(profile_path)
+            coupling_path = isnothing(coupling_path) ? base[1] * "_coupling" * base[2] : coupling_path
+        end
+        coupling_path isa AbstractString && save_coupling_matrix(coupling_path, coupling.matrix)
+
+        L, parts = lossfn(cog, tokens; λ_square=λ_square, λ_neg=λ_neg, λ_KL=λ_KL, λ_rec=λ_rec, λ_self=λ_self,
+            λ_jnd=λ_jnd, λ_instab=λ_instab, ε_instab=ε_instab, instab_samples=instab_samples,
+            λ_struct=λ_struct, λ_rules=λ_rules, λ_mono=λ_mono, λ_global=λ_global, λ_couple=λ_couple, λ_time=λ_time, dev_state=dev_state)
+
+        parts.flow !== nothing && Archetypal.update!(dev_state, parts.global; flow=parts.flow)
+
+        push!(rows, (;
+            step=Int(step),
+            L_total=L,
+            Lcouple=parts.Lcouple,
+            L_time=parts.L_time,
+            m=dev_state.m,
+            s=dev_state.s,
+            instab=instab,
+            H_start=_flowval(parts.flow, :H_start),
+            H_end=_flowval(parts.flow, :H_end),
+            H_mean=_flowval(parts.flow, :H_mean),
+            conflict=_flowval(parts.flow, :conflict),
+        ))
+
+        last_tokens = tokens
+        last_psi = psi
+        last_sweep = sweep
+        last_spark = spark
+        last_coupling = (;
+            coupling...,
+            spark=coupling_spark,
+            heatmap=coupling_heat,
+            path=coupling_path,
+        )
+
+        visualize && @info "cognitive trace step" step L parts dev_state instab spark coupling_spark parts.flow
+    end
+
+    trace_table = cognitive_trace_table(rows)
+    save_trace === nothing || save_cognitive_trace(save_trace, rows)
+
+    return (; trace=rows, table=trace_table, tokens=last_tokens, psi=last_psi, sweep=last_sweep, spark=last_spark,
+            coupling=last_coupling, dev_state=dev_state, profile_path=profile_path, coupling_path=coupling_path)
+end
+
+function cognitive_trace_table(trace)
+    io = IOBuffer()
+    println(io, "step,L_total,Lcouple,L_time,m,s,instab,H_start,H_end,H_mean,conflict")
+    for row in trace
+        println(io, "$(row.step),$(row.L_total),$(row.Lcouple),$(row.L_time),$(row.m),$(row.s),$(row.instab),$(row.H_start),$(row.H_end),$(row.H_mean),$(row.conflict)")
+    end
+    return String(take!(io))
+end
+
+function save_cognitive_trace(path::AbstractString, trace)
+    open(path, "w") do io
+        println(io, cognitive_trace_table(trace))
+    end
+    return path
+end
+
 end # module
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    @info "Running toy training loop from SemioticTransformer.jl"
+    SemioticTransformer.toy_train()
+end
