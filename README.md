@@ -320,6 +320,29 @@ extra-semiotic drift induced by silence, timing, or other non-symbolic cues.
   scripts/cognitive_probe.jl
   ```
 
+* **Roll a developmental trace.** `cognitive_trace` keeps sampling sequences,
+  updating the shared `DevState`, and logging ψ instability + archetypal flow
+  metrics step by step. It returns both the trace table and the last ψ snapshot
+  plus coupling heatmap/sparkline so you can see how alignment and stress evolve
+  together:
+
+  ```julia
+  trace = SemioticTransformer.cognitive_trace(; vocab=18, d=28, seq=10, steps=8,
+      λ_global=0.5f0, λ_couple=2f-3, λ_instab=5f-4, λ_time=5f-3,
+      save_profile="trace_instability.csv", save_coupling="trace_coupling.csv", save_trace="dev_trace.csv")
+  trace.table      # CSV-friendly string with losses, DevState, entropy/conflict
+  trace.coupling   # last distance matrix + sparkline + saved path
+  trace.psi.Φ      # last ψ-lattice potential snapshot
+  ```
+
+  Shell entrypoint:
+
+  ```bash
+  SEMIOTIC_TRACE_STEPS=10 SEMIOTIC_LAMBDA_TIME=5e-3 \
+  SEMIOTIC_COUPLING_PATH=trace_coupling.csv SEMIOTIC_TRACE_PATH=dev_trace.csv \
+  scripts/cognitive_trace.jl
+  ```
+
 ### Temporal development and regression dynamics
 
 * **Track a slow “psychic state.”** Archetypal runs can maintain a `DevState`

@@ -93,6 +93,19 @@ end
     @test length(probe.coupling.proto_min) == local_k
     @test length(probe.coupling.center_min) == global_K
     @test !isempty(probe.heatmaps.coupling)
+
+    trace = SemioticTransformer.cognitive_trace(; vocab=vocab, d=d, seq=5, steps=3, seed=9,
+        λ_global=0.25f0, λ_couple=5f-3, λ_instab=1f-3, instab_samples=2, profile_width=6, λ_time=2f-3)
+    @test length(trace.trace) == 3
+    @test occursin("step,L_total", trace.table)
+    @test trace.coupling.spark != ""
+    @test trace.coupling.heatmap != ""
+    @test trace.psi isa SemioticTransformer.PsiState
+    @test trace.dev_state isa SemioticTransformer.Archetypal.DevState
+    @test all(row -> isfinite(row.L_total) && isfinite(row.instab), trace.trace)
+    tmptrace = tempname()
+    SemioticTransformer.save_cognitive_trace(tmptrace, trace.trace)
+    @test isfile(tmptrace)
 end
 
 @testset "Archetypal time dynamics" begin

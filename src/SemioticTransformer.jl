@@ -1787,6 +1787,115 @@ function cognitive_probe(; vocab::Int=16, d::Int=24, seq::Int=8, seed::Int=0,
             L_time=parts.L_time, flow=parts.flow, dev_state=dev_state)
 end
 
+function _flowval(flow, field::Symbol)
+    flow === nothing && return T(NaN)
+    return getproperty(flow, field)
+end
+
+function cognitive_trace(; vocab::Int=16, d::Int=24, seq::Int=8, steps::Int=16, seed::Int=0,
+        local_layers::Int=1, local_H::Int=3, local_k::Int=4, local_z::Int=12,
+        global_K::Int=3, global_ds::Int=12, global_r::Int=16, global_λ_pair::T=0.5f0,
+        λ_square::T=T(0.05), λ_neg::T=T(1e-3), λ_KL::T=T(1e-3), λ_rec::T=T(1e-2),
+        λ_self::T=T(1e-2), λ_jnd::T=T(1e-3), λ_instab::T=T(0f0), ε_instab::T=T(1e-3), instab_samples::Int=1,
+        λ_struct::T=T(1e-3), λ_rules::T=T(1e-2), λ_mono::T=T(1e-3), λ_global::T=T(1f0), λ_couple::T=T(1e-3), λ_time::T=T(0f0),
+        epsilons::AbstractVector{T}=T[1f-4, 5f-4, 1f-3, 5f-3], profile_width::Int=28,
+        save_profile::Union{Nothing,AbstractString}=nothing, save_coupling::Union{Nothing,AbstractString}=nothing,
+        save_trace::Union{Nothing,AbstractString}=nothing, visualize::Bool=true)
+    seed >= 0 && Random.seed!(seed)
+
+    emb = Flux.Embedding(vocab, d)
+    cog = CognitiveModel(emb; classes=vocab, local_layers=local_layers, local_H=local_H, local_k=local_k, local_z=local_z,
+        global_K=global_K, global_ds=global_ds, global_r=global_r, global_λ_pair=global_λ_pair)
+
+    dev_state = Archetypal.DevState()
+    rows = Vector{NamedTuple{(:step, :L_total, :Lcouple, :L_time, :m, :s, :instab, :H_start, :H_end, :H_mean, :conflict),
+        Tuple{Int, T, T, T, Float32, Float32, T, T, T, T, T}}}()
+
+    last_tokens = nothing
+    last_psi = nothing
+    last_sweep = nothing
+    last_spark = ""
+    last_coupling = nothing
+    coupling_path = save_coupling
+    profile_path = save_profile
+
+    for step in 1:steps
+        tokens = rand(1:vocab, seq)
+        forward_out = forward(cog, tokens; update_fields=true)
+        psi = forward_out.psi
+        mf = cog.local.blocks[end].mf
+
+        instab = meaning_instability(mf, psi.X; ε=ε_instab, samples=instab_samples)
+        sweep = meaning_instability_profile(mf, psi.X; epsilons=epsilons, samples=instab_samples)
+        spark = instability_sparkline(sweep; width=profile_width)
+        isnothing(profile_path) || save_instability_profile(profile_path, sweep)
+
+        coupling = coupling_profile(cog.local, cog.global)
+        coupling_spark = coupling_sparkline(coupling.proto_min; width=profile_width)
+        coupling_heat = ascii_heatmap(coupling.matrix)
+        if profile_path isa AbstractString
+            base = splitext(profile_path)
+            coupling_path = isnothing(coupling_path) ? base[1] * "_coupling" * base[2] : coupling_path
+        end
+        coupling_path isa AbstractString && save_coupling_matrix(coupling_path, coupling.matrix)
+
+        L, parts = lossfn(cog, tokens; λ_square=λ_square, λ_neg=λ_neg, λ_KL=λ_KL, λ_rec=λ_rec, λ_self=λ_self,
+            λ_jnd=λ_jnd, λ_instab=λ_instab, ε_instab=ε_instab, instab_samples=instab_samples,
+            λ_struct=λ_struct, λ_rules=λ_rules, λ_mono=λ_mono, λ_global=λ_global, λ_couple=λ_couple, λ_time=λ_time, dev_state=dev_state)
+
+        parts.flow !== nothing && Archetypal.update!(dev_state, parts.global; flow=parts.flow)
+
+        push!(rows, (;
+            step=Int(step),
+            L_total=L,
+            Lcouple=parts.Lcouple,
+            L_time=parts.L_time,
+            m=dev_state.m,
+            s=dev_state.s,
+            instab=instab,
+            H_start=_flowval(parts.flow, :H_start),
+            H_end=_flowval(parts.flow, :H_end),
+            H_mean=_flowval(parts.flow, :H_mean),
+            conflict=_flowval(parts.flow, :conflict),
+        ))
+
+        last_tokens = tokens
+        last_psi = psi
+        last_sweep = sweep
+        last_spark = spark
+        last_coupling = (;
+            coupling...,
+            spark=coupling_spark,
+            heatmap=coupling_heat,
+            path=coupling_path,
+        )
+
+        visualize && @info "cognitive trace step" step L parts dev_state instab spark coupling_spark parts.flow
+    end
+
+    trace_table = cognitive_trace_table(rows)
+    save_trace === nothing || save_cognitive_trace(save_trace, rows)
+
+    return (; trace=rows, table=trace_table, tokens=last_tokens, psi=last_psi, sweep=last_sweep, spark=last_spark,
+            coupling=last_coupling, dev_state=dev_state, profile_path=profile_path, coupling_path=coupling_path)
+end
+
+function cognitive_trace_table(trace)
+    io = IOBuffer()
+    println(io, "step,L_total,Lcouple,L_time,m,s,instab,H_start,H_end,H_mean,conflict")
+    for row in trace
+        println(io, "$(row.step),$(row.L_total),$(row.Lcouple),$(row.L_time),$(row.m),$(row.s),$(row.instab),$(row.H_start),$(row.H_end),$(row.H_mean),$(row.conflict)")
+    end
+    return String(take!(io))
+end
+
+function save_cognitive_trace(path::AbstractString, trace)
+    open(path, "w") do io
+        println(io, cognitive_trace_table(trace))
+    end
+    return path
+end
+
 end # module
 
 if abspath(PROGRAM_FILE) == @__FILE__
