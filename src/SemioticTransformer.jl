@@ -1,12 +1,14 @@
 module SemioticTransformer
 
 using Flux
+using Flux: onehotbatch
 using LinearAlgebra
 using Statistics
 using Random
 using NNlib # for softplus, softmax
 using Functors
 const T = Float32
+const _param = isdefined(Flux, :param) ? Flux.param : identity
 
 # -----------------------------
 # Negation（involution-ish）
@@ -20,9 +22,8 @@ negate(neg::Negation, x::AbstractVecOrMat{T}) = neg.N * x
 
 function negation_penalty(neg::Negation; λ_inv=T(1e-3), λ_iso=T(1e-3), λ_sym=T(1e-4))
     d = size(neg.N, 1)
-    I = Matrix{T}(I, d, d)
-    L_inv = norm(neg.N * neg.N .- I)^2
-    L_iso = norm(neg.N' * neg.N .- I)^2
+    L_inv = norm(neg.N * neg.N .- I(d))^2
+    L_iso = norm(neg.N' * neg.N .- I(d))^2
     L_sym = norm(neg.N .- neg.N')^2
     return λ_inv * L_inv + λ_iso * L_iso + λ_sym * L_sym
 end
@@ -38,31 +39,16 @@ end
 DifferenceField(d::Int; φ = NNlib.softplus) = DifferenceField(Matrix{T}(I, d, d), φ)
 
 function difference_matrix(df::DifferenceField, X::AbstractMatrix{T})
-    _, n = size(X)
+    n = size(X, 2)
     M = df.M
-    D = Matrix{T}(undef, n, n)
-    @inbounds @views for i in 1:n
-        xi = X[:, i]
-        D[i, i] = df.φ(zero(T))
-        i == n && continue
-        for j in (i + 1):n
-            Δ = xi .- X[:, j]
-            val = df.φ(dot(Δ, M * Δ))
-            D[i, j] = val
-            D[j, i] = val
-        end
-    end
-    return D
+    return [i == j ? df.φ(zero(T)) : df.φ(dot((view(X, :, i) .- view(X, :, j)), M * (view(X, :, i) .- view(X, :, j))))
+            for i in 1:n, j in 1:n]
 end
 
 function difference_matrix(df::DifferenceField, X::AbstractArray{T,3})
-    n = size(X, 2)
     batches = size(X, 3)
-    D = Array{T}(undef, n, n, batches)
-    @inbounds @views for b in 1:batches
-        D[:, :, b] = difference_matrix(df, view(X, :, :, b))
-    end
-    return D
+    Ds = (difference_matrix(df, view(X, :, :, b)) for b in 1:batches)
+    return cat(Ds...; dims=3)
 end
 
 # -----------------------------
@@ -77,39 +63,56 @@ end
 MeaningField(d::Int, k::Int; scale=T(1.0)) =
     MeaningField(Flux.glorot_uniform(d, k), ones(T, k), scale)
 
-function potential(mf::MeaningField, X::AbstractMatrix{T})
-    d, n = size(X)
-    k = size(mf.P, 2)
-    Φ = zeros(T, n)
-    @inbounds for j in 1:n
-        x = view(X, :, j)
-        s = zero(T)
-        for t in 1:k
-            p = view(mf.P, :, t)
-            δ = x .- p
-            s += -mf.w[t] * (δ' * δ)
+function _meaning_weights(mf::MeaningField)
+    w = NNlib.softplus.(mf.w)
+    k = length(w)
+    scale = T(k) / (sum(w) + eps(T))
+    return w .* scale
+end
+
+function _clip_columns!(M::AbstractMatrix{T}; max_norm::T=T(10.0)) where {T}
+    @inbounds for j in 1:size(M, 2)
+        col = view(M, :, j)
+        n = norm(col)
+        if n > max_norm
+            col .= (max_norm / (n + eps(T))) .* col
         end
-        Φ[j] = mf.scale * s
     end
-    return Φ
+    return M
+end
+
+function potential(mf::MeaningField, X::AbstractMatrix{T})
+    n = size(X, 2)
+    k = size(mf.P, 2)
+    w = _meaning_weights(mf)
+    return mf.scale .* [
+        begin
+            x = view(X, :, j)
+            sum(-w[t] * sum(abs2, x .- view(mf.P, :, t)) for t in 1:k)
+        end for j in 1:n
+    ]
 end
 
 function potential(mf::MeaningField, X::AbstractArray{T,3})
-    n = size(X, 2)
     batches = size(X, 3)
-    Φ = zeros(T, n, batches)
-    @inbounds @views for b in 1:batches
-        Φ[:, b] = potential(mf, view(X, :, :, b))
-    end
-    return Φ
+    Φs = (potential(mf, view(X, :, :, b)) for b in 1:batches)
+    return hcat(Φs...)
 end
 
 function potential_grad(mf::MeaningField, x::AbstractVector{T})
+    w = _meaning_weights(mf)
     g = zeros(T, length(x))
     @inbounds for t in 1:size(mf.P, 2)
-        g .+= -2f0 * mf.w[t] .* (x .- view(mf.P, :, t))
+        g = g .+ (-2f0 * w[t]) .* (x .- view(mf.P, :, t))
     end
     return mf.scale .* g
+end
+
+function potential_grad(mf::MeaningField, X::AbstractMatrix{T})
+    w = _meaning_weights(mf)
+    wsum = sum(w)
+    pw = mf.P * w
+    return mf.scale .* (-2f0) .* (wsum .* X .- pw)
 end
 
 function meaning_instability(mf::MeaningField, X::AbstractMatrix{T}; ε::T=T(1e-3), samples::Int=1)
@@ -147,8 +150,6 @@ struct PsiState{TX,TΦ,TD}
 end
 
 psi_state(mf::MeaningField, df::DifferenceField, X) = PsiState(X, potential(mf, X), difference_matrix(df, X))
-psi_state(b::SemioticBlock, X) = psi_state(b.mf, b.df, X)
-psi_state(m::SemioticModel, X) = psi_state(m.blocks[end], X)
 
 function meaning_instability_profile(mf::MeaningField, X; epsilons::AbstractVector{T}=T[1f-4, 5f-4, 1f-3, 5f-3], samples::Int=4)
     return [(ϵ, meaning_instability(mf, X; ε=ϵ, samples=samples)) for ϵ in epsilons]
@@ -187,6 +188,7 @@ function save_instability_profile(path::AbstractString, profile)
 end
 
 function update!(mf::MeaningField, X::AbstractMatrix{T}; τ=T(0.95), temp=T(1.0))
+    any(!isfinite, X) && return nothing
     d, n = size(X)
     k = size(mf.P, 2)
     R = zeros(T, k, n)
@@ -197,6 +199,7 @@ function update!(mf::MeaningField, X::AbstractMatrix{T}; τ=T(0.95), temp=T(1.0)
             R[t, j] = -sum(abs2, δ) / temp
         end
     end
+    R .= clamp.(R, -T(80), zero(T))
     R .= NNlib.softmax(R; dims=1)
     Nk = sum(R; dims=2)
     newP = similar(mf.P)
@@ -211,11 +214,15 @@ function update!(mf::MeaningField, X::AbstractMatrix{T}; τ=T(0.95), temp=T(1.0)
             newP[:, t] = mf.P[:, t]
         end
     end
+    _clip_columns!(newP; max_norm=T(10.0))
+    any(!isfinite, newP) && return nothing
     mf.P .= τ .* mf.P .+ (one(T) - τ) .* newP
+    _clip_columns!(mf.P; max_norm=T(10.0))
     return nothing
 end
 
 function update!(mf::MeaningField, X::AbstractArray{T,3}; τ=T(0.95), temp=T(1.0))
+    any(!isfinite, X) && return nothing
     d, n, batches = size(X)
     k = size(mf.P, 2)
     R = zeros(T, k, n, batches)
@@ -228,6 +235,7 @@ function update!(mf::MeaningField, X::AbstractArray{T,3}; τ=T(0.95), temp=T(1.0
             end
         end
     end
+    R .= clamp.(R, -T(80), zero(T))
     R .= NNlib.softmax(R; dims=1)
     Nk = sum(R; dims=(2, 3))
     newP = similar(mf.P)
@@ -242,7 +250,10 @@ function update!(mf::MeaningField, X::AbstractArray{T,3}; τ=T(0.95), temp=T(1.0
             newP[:, t] = mf.P[:, t]
         end
     end
+    _clip_columns!(newP; max_norm=T(10.0))
+    any(!isfinite, newP) && return nothing
     mf.P .= τ .* mf.P .+ (one(T) - τ) .* newP
+    _clip_columns!(mf.P; max_norm=T(10.0))
     return nothing
 end
 
@@ -293,7 +304,7 @@ sample_z(μ::AbstractVecOrMat{T}, logσ::AbstractVecOrMat{T}) = μ .+ exp.(0.5f0
 
 function encode_decode(nm::Noumenon, X::AbstractMatrix{T})
     μ = nm.Ezμ(X)
-    logσ = nm.Ezlogσ(X)
+    logσ = clamp.(nm.Ezlogσ(X), T(-10), T(10))
     Z = sample_z(μ, logσ)
     Xhat = nm.Dz(Z)
     KL = 0.5f0 * sum(exp.(logσ) .+ μ.^2 .- one(T) .- logσ) / size(X, 2)
@@ -305,7 +316,7 @@ function encode_decode(nm::Noumenon, X::AbstractArray{T,3})
     cols = n * batches
     Xflat = reshape(X, d, cols)
     μ = nm.Ezμ(Xflat)
-    logσ = nm.Ezlogσ(Xflat)
+    logσ = clamp.(nm.Ezlogσ(Xflat), T(-10), T(10))
     Z = sample_z(μ, logσ)
     Xhat = nm.Dz(Z)
     KL = 0.5f0 * sum(exp.(logσ) .+ μ.^2 .- one(T) .- logσ) / cols
@@ -317,21 +328,28 @@ end
 # -----------------------------
 struct SelfField
     s::Vector{T}
+    neg::Negation
     α::T
 end
 @functor SelfField
-SelfField(d::Int; α=T(0.5)) = SelfField(Flux.glorot_uniform(d), α)
+SelfField(d::Int; α=T(0.5)) = SelfField(Flux.glorot_uniform(d), Negation(d), α)
 
 function coniunctio(neg::Negation, x::AbstractVector{T}; α::T=T(0.5))
     y = (one(T) - α) .* x .+ α .* (neg.N * x)
     return y ./ max(norm(y), eps(T))
 end
 
-function self_loss(sf::SelfField, neg::Negation, Φgrad::Function, A::AbstractVector{T}, B::AbstractVector{T}; λ_eq=T(1.0), λ_stat=T(0.1))
-    cA = coniunctio(neg, A; α=sf.α)
-    cB = coniunctio(neg, B; α=sf.α)
-    L_eq = norm(sf.s .- cA)^2 + norm(sf.s .- cB)^2
-    L_stat = norm(Φgrad(sf.s))^2
+function _self_state(sf::SelfField)
+    n = norm(sf.s)
+    return n > one(T) ? sf.s ./ n : sf.s
+end
+
+function self_loss(sf::SelfField, Φgrad::Function, A::AbstractVector{T}, B::AbstractVector{T}; λ_eq=T(1.0), λ_stat=T(0.1))
+    cA = coniunctio(sf.neg, A; α=sf.α)
+    cB = coniunctio(sf.neg, B; α=sf.α)
+    s = _self_state(sf)
+    L_eq = norm(s .- cA)^2 + norm(s .- cB)^2
+    L_stat = norm(Φgrad(s))^2
     return λ_eq * L_eq + λ_stat * L_stat
 end
 
@@ -340,42 +358,27 @@ end
 # -----------------------------
 function diff_grad(df::DifferenceField, X::AbstractMatrix{T})
     M = df.M
-    d, n = size(X)
-    G = zeros(T, d, n)
+    n = size(X, 2)
     μ = mean(X; dims=2)
-    @inbounds for j in 1:n
-        G[:, j] .= 2f0 .* (M * (n .* view(X, :, j) .- vec(μ)))
-    end
-    return G
+    return 2f0 .* (M * (n .* X .- μ))
 end
 
 function diff_grad(df::DifferenceField, X::AbstractArray{T,3})
-    d, n, batches = size(X)
-    G = zeros(T, d, n, batches)
-    @inbounds for b in 1:batches
-        G[:, :, b] .= diff_grad(df, view(X, :, :, b))
-    end
-    return G
+    batches = size(X, 3)
+    grads = (diff_grad(df, view(X, :, :, b)) for b in 1:batches)
+    return cat(grads...; dims=3)
 end
 
 function will_step!(X::AbstractMatrix{T}, mf::MeaningField, df::DifferenceField; η=T(1e-2), ρ=T(1e-3))
-    d, n = size(X)
-    Gφ = similar(X)
-    for j in 1:n
-        Gφ[:, j] = potential_grad(mf, view(X, :, j))
-    end
+    Gφ = potential_grad(mf, X)
     GD = diff_grad(df, X)
-    X .+= η .* Gφ .- ρ .* GD
-    return X
+    return X .+ η .* Gφ .- ρ .* GD
 end
 
 function will_step!(X::AbstractArray{T,3}, mf::MeaningField, df::DifferenceField; η=T(1e-2), ρ=T(1e-3))
-    d, n, batches = size(X)
-    for b in 1:batches
-        tmp = view(X, :, :, b)
-        will_step!(tmp, mf, df; η=η, ρ=ρ)
-    end
-    return X
+    batches = size(X, 3)
+    stepped = (will_step!(view(X, :, :, b), mf, df; η=η, ρ=ρ) for b in 1:batches)
+    return cat(stepped...; dims=3)
 end
 
 # -----------------------------
@@ -435,7 +438,7 @@ function SemioticMHA(d::Int; H::Int=3, dk::Int=div(d, H), dv::Int=div(d, H))
                        β = r == Contradiction ? T(0.8) : r == Contrary ? T(0.4) : T(0.2),
                        γ = r == Implication   ? T(0.6) : T(0.2),
                        η = T(0.3)) for r in roles]
-    SemioticMHA(hs, Flux.glorot_uniform(d, dv * H), Negation(d))
+    SemioticMHA(hs, Flux.glorot_uniform(d, dv * H), Negation(dk))
 end
 
 function role_bias(h::SemioticHead, Q::AbstractMatrix{T}, K::AbstractMatrix{T}, Φ::AbstractVector{T}, neg::Negation)
@@ -444,27 +447,27 @@ function role_bias(h::SemioticHead, Q::AbstractMatrix{T}, K::AbstractMatrix{T}, 
     Φpair = (Φrow .+ Φrow') .* 0.5f0
     S = (Q' * K) ./ sqrt(T(size(Q, 1)))
     D = difference_matrix(h.df, K)
-    R = zeros(T, n, n)
-    if h.role == Implication
+    R = if h.role == Implication
         NK = negate(neg, K)
         S_imp = (Q' * NK) ./ sqrt(T(size(Q, 1)))
-        R .= h.η .* S_imp
+        h.η .* S_imp
     elseif h.role == Contradiction
-        R .= -h.η .* D
-    elseif h.role == Contrary
-        R .= -0.5f0 .* h.η .* D
+        -h.η .* D
+    else
+        -0.5f0 .* h.η .* D
     end
     return S .- h.β .* D .+ h.γ .* Φpair .+ R
 end
 
 function (mha::SemioticMHA)(X::AbstractMatrix{T}, Φ::AbstractVector{T})
-    parts = Matrix{T}[]
-    for h in mha.heads
-        Q, K, V = h.WQ * X, h.WK * X, h.WV * X
-        A = role_bias(h, Q, K, Φ, mha.neg)
-        P = NNlib.softmax(A; dims=2)
-        push!(parts, V * P')
-    end
+    parts = [
+        begin
+            Q, K, V = h.WQ * X, h.WK * X, h.WV * X
+            A = role_bias(h, Q, K, Φ, mha.neg)
+            P = NNlib.softmax(A; dims=2)
+            V * P'
+        end for h in mha.heads
+    ]
     return mha.WO * reduce(vcat, parts)
 end
 
@@ -477,21 +480,24 @@ function (mha::SemioticMHA)(X::AbstractArray{T,3}, Φ::AbstractMatrix{T})
     Qs = [reshape(h.WQ * Xflat, dk, n, batches) for h in mha.heads]
     Ks = [reshape(h.WK * Xflat, dk, n, batches) for h in mha.heads]
     Vs = [reshape(h.WV * Xflat, dv, n, batches) for h in mha.heads]
-    out = zeros(T, d, n, batches)
-    @inbounds for b in 1:batches
-        Φcol = view(Φ, :, b)
-        Φrow = reshape(Φcol, 1, :)
-        for idx in 1:length(mha.heads)
+    head_outputs = [
+        begin
             h = mha.heads[idx]
-            Q = Qs[idx][:, :, b]
-            K = Ks[idx][:, :, b]
-            V = Vs[idx][:, :, b]
-            A = role_bias(h, Q, K, Φcol, mha.neg)
-            P = NNlib.softmax(A; dims=2)
-            out[:, :, b] .+= mha.WO[:, ((idx - 1) * dv + 1):(idx * dv)] * (V * P')
-        end
-    end
-    return out
+            WO = mha.WO[:, ((idx - 1) * dv + 1):(idx * dv)]
+            batch_outs = [
+                begin
+                    Q = Qs[idx][:, :, b]
+                    K = Ks[idx][:, :, b]
+                    V = Vs[idx][:, :, b]
+                    A = role_bias(h, Q, K, view(Φ, :, b), mha.neg)
+                    P = NNlib.softmax(A; dims=2)
+                    WO * (V * P')
+                end for b in 1:batches
+            ]
+            cat(batch_outs...; dims=3)
+        end for idx in 1:length(mha.heads)
+    ]
+    return reduce(+, head_outputs)
 end
 
 # -----------------------------
@@ -505,7 +511,7 @@ struct MeaningChainLayer
 end
 @functor MeaningChainLayer
 function MeaningChainLayer(d::Int; h::Int=d)
-    MeaningChainLayer(Dense(d, d), Dense(d, h, gelu), Dense(h, d), param([T(0.6), T(0.3), T(0.1)]))
+    MeaningChainLayer(Dense(d, d), Dense(d, h, gelu), Dense(h, d), _param([T(0.6), T(0.3), T(0.1)]))
 end
 
 function (m::MeaningChainLayer)(X::AbstractMatrix{T}, Φ::AbstractVector{T})
@@ -559,12 +565,13 @@ function (b::SemioticBlock)(X::AbstractMatrix{T}; update_field::Bool=false, will
     Z, Xhat, KL = encode_decode(b.nm, X)
     Φ = potential(b.mf, X)
     Y = X .+ b.mha(_apply_layernorm(b.norm1, X), Φ)
-    Z2 = Y .+ b.chain(_apply_layernorm(b.norm2, Y), Φ)
+    Zbase = Y .+ b.chain(_apply_layernorm(b.norm2, Y), Φ)
+    Z2 = Zbase
     if will
-        will_step!(Z2, b.mf, b.df)
+        Z2 = will_step!(Z2, b.mf, b.df)
     end
     if update_field
-        update!(b.mf, Z2)
+        update!(b.mf, Zbase)
     end
     recL = mean((X .- Xhat).^2)
     return Z2, KL, recL
@@ -574,12 +581,13 @@ function (b::SemioticBlock)(X::AbstractArray{T,3}; update_field::Bool=false, wil
     Z, Xhat, KL = encode_decode(b.nm, X)
     Φ = potential(b.mf, X)
     Y = X .+ b.mha(_apply_layernorm(b.norm1, X), Φ)
-    Z2 = Y .+ b.chain(_apply_layernorm(b.norm2, Y), Φ)
+    Zbase = Y .+ b.chain(_apply_layernorm(b.norm2, Y), Φ)
+    Z2 = Zbase
     if will
-        will_step!(Z2, b.mf, b.df)
+        Z2 = will_step!(Z2, b.mf, b.df)
     end
     if update_field
-        update!(b.mf, Z2)
+        update!(b.mf, Zbase)
     end
     recL = mean((X .- Xhat).^2)
     return Z2, KL, recL
@@ -619,6 +627,9 @@ end
 function SemioticModel(vocab::Int, d::Int; layers::Int=2, H::Int=3, k::Int=8, z::Int=div(d, 2), classes::Int=vocab, square=nothing, squares=nothing)
     return SemioticModel(Flux.Embedding(vocab, d); layers=layers, H=H, k=k, z=z, classes=classes, square=square, squares=squares)
 end
+
+psi_state(b::SemioticBlock, X) = psi_state(b.mf, b.df, X)
+psi_state(m::SemioticModel, X) = psi_state(m.blocks[end], X)
 
 function _forward_embedded(m::SemioticModel, X; update_field=false, will=false)
     total_KL = zero(T)
@@ -695,7 +706,7 @@ end
 function _self_loss_block(b::SemioticBlock, X::AbstractMatrix{T})
     size(X, 2) < 2 && return zero(T)
     A = view(X, :, 1); B = view(X, :, 2)
-    return self_loss(b.sf, b.mha.neg, x -> potential_grad(b.mf, x), A, B; λ_eq=T(1.0), λ_stat=T(0.1))
+    return self_loss(b.sf, x -> potential_grad(b.mf, x), A, B; λ_eq=T(1.0), λ_stat=T(0.1))
 end
 
 function _self_loss_block(b::SemioticBlock, X::AbstractArray{T,3})
@@ -777,7 +788,20 @@ function ascii_heatmap(M::AbstractMatrix{<:Real}; levels=_heat_levels())
     return String(take!(chars))
 end
 
-function toy_train(; seed=7)
+function _tree_all_finite(x)
+    ok = Ref(true)
+    Functors.fmap(x) do leaf
+        if leaf isa AbstractArray
+            any(!isfinite, leaf) && (ok[] = false)
+        elseif leaf isa Number
+            isfinite(leaf) || (ok[] = false)
+        end
+        return leaf
+    end
+    return ok[]
+end
+
+function toy_train(; seed=7, steps::Int=80, log_every::Int=10, will_start::Int=20, field_start::Int=40, will::Bool=true, update_field::Bool=true)
     Random.seed!(seed)
     vocab = 8; d = 64
     sq = SemioticSquare(1, 2, 3, 4)
@@ -785,19 +809,26 @@ function toy_train(; seed=7)
 
     tokens  = [1, 2, 5, 6, 7, 3, 4, 2]
     targets = [2, 1, 5, 6, 7, 4, 3, 1]
-    opt = Flux.setup(Flux.Optimisers.Adam(1e-3), m)
+    rule = Flux.Optimisers.OptimiserChain(Flux.Optimisers.ClipNorm(1.0), Flux.Optimisers.Adam(1e-3))
+    opt = Flux.setup(rule, m)
 
-    for step in 1:80
-        gs = Flux.gradient(Flux.params(m)) do
-            L, _ = lossfn(m, tokens, targets; λ_square=0.05f0, λ_neg=0.01f0)
+    for step in 1:steps
+        use_will = will && step >= will_start
+        use_field = update_field && step >= field_start
+        grads = Flux.gradient(m) do model
+            L, _ = lossfn(model, tokens, targets; λ_square=0.05f0, λ_neg=0.01f0, will=use_will, update_field=false)
             L
         end
-        Flux.update!(opt, Flux.params(m), gs)
-        _, _, _, acts = forward(m, tokens; update_field=true, will=true)
-        if step % 10 == 0
-            L, parts = lossfn(m, tokens, targets; λ_square=0.05f0, λ_neg=0.01f0)
+        if _tree_all_finite(grads[1])
+            Flux.update!(opt, m, grads[1])
+        else
+            @warn "non-finite gradient; skipping update" step=step will=use_will update_field=use_field
+        end
+        _, _, _, acts = forward(m, tokens; update_field=use_field, will=use_will)
+        if log_every > 0 && step % log_every == 0
+            L, parts = lossfn(m, tokens, targets; λ_square=0.05f0, λ_neg=0.01f0, will=use_will, update_field=false)
             instab = meaning_instability(m.blocks[end].mf, acts; ε=5f-4, samples=4)
-            @info "step=$step" loss=L instab parts
+            @info "step=$step" loss=L instab will=use_will update_field=use_field parts
         end
     end
     return m
@@ -850,8 +881,9 @@ module Archetypal
 using Flux, LinearAlgebra, Random, NNlib, Functors
 import ..SemioticTransformer
     using ..SemioticTransformer: T, Negation, negation_penalty, DifferenceField, difference_matrix,
-        MeaningField, potential, potential_grad, update!, MeaningChainLayer, SelfField, coniunctio,
+        MeaningField, potential, potential_grad, MeaningChainLayer, SelfField, coniunctio,
         _apply_layernorm, _apply_dense, next_token_pairs, _ce_loss
+    import ..SemioticTransformer: update!
 
     struct DevState
         m::Float32
@@ -896,7 +928,7 @@ import ..SemioticTransformer
         return st
     end
 
-    function time_dynamics_loss(block::ArchetypalBlock,
+    function time_dynamics_loss(block,
             Y::AbstractMatrix{T},
             W::AbstractMatrix{T},
             dev::DevState;
@@ -1033,7 +1065,7 @@ function SemioticMHA(d::Int; H::Int=3, dk::Int=div(d, H), dv::Int=div(d, H))
             η = T(0.3),
         ) for r in roles
     ]
-    SemioticMHA(hs, Flux.glorot_uniform(d, dv * H), Negation(d))
+    SemioticMHA(hs, Flux.glorot_uniform(d, dv * H), Negation(dk))
 end
 
 neg_penalty(mha::SemioticMHA; kw...) = negation_penalty(mha.neg; kw...)
@@ -1044,27 +1076,27 @@ function role_bias(h::SemioticHead, Q::AbstractMatrix{T}, K::AbstractMatrix{T}, 
     Φpair = (Φrow .+ Φrow') .* 0.5f0
     S = (Q' * K) ./ sqrt(T(size(Q, 1)))
     D = difference_matrix(h.df, K)
-    R = zeros(T, n, n)
-    if h.role == Implication
+    R = if h.role == Implication
         NK = negate(neg, K)
         S_imp = (Q' * NK) ./ sqrt(T(size(Q, 1)))
-        R .= h.η .* S_imp
+        h.η .* S_imp
     elseif h.role == Contradiction
-        R .= -h.η .* D
-    elseif h.role == Contrary
-        R .= -0.5f0 .* h.η .* D
+        -h.η .* D
+    else
+        -0.5f0 .* h.η .* D
     end
     S .- h.β .* D .+ h.γ .* Φpair .+ R
 end
 
 function (mha::SemioticMHA)(X::AbstractMatrix{T}, Φ::AbstractVector{T})
-    parts = Matrix{T}[]
-    for h in mha.heads
-        Q, K, V = h.WQ * X, h.WK * X, h.WV * X
-        A = role_bias(h, Q, K, Φ, mha.neg)
-        P = NNlib.softmax(A; dims=2)
-        push!(parts, V * P')
-    end
+    parts = [
+        begin
+            Q, K, V = h.WQ * X, h.WK * X, h.WV * X
+            A = role_bias(h, Q, K, Φ, mha.neg)
+            P = NNlib.softmax(A; dims=2)
+            V * P'
+        end for h in mha.heads
+    ]
     mha.WO * reduce(vcat, parts)
 end
 
@@ -1108,7 +1140,8 @@ function _unit_forward(u::ArchetypeUnit, Xg::AbstractMatrix{T}; will::Bool=true,
     X = u.F.V * Xg
     Φ = potential(u.mf, X)
     Y = X .+ u.mha(u.norm1(X), Φ)
-    Z = Y .+ u.chain(u.norm2(Y), Φ)
+    Zbase = Y .+ u.chain(u.norm2(Y), Φ)
+    Z = Zbase
     if will
         Gφ = similar(Z)
         for j in 1:size(Z, 2)
@@ -1119,10 +1152,10 @@ function _unit_forward(u::ArchetypeUnit, Xg::AbstractMatrix{T}; will::Bool=true,
         @inbounds for j in 1:size(Z, 2)
             GD[:, j] .= 2f0 .* (u.df.M * (size(Z, 2) .* view(Z, :, j) .- vec(μ)))
         end
-        Z .+= 1e-2f0 .* Gφ .- 1e-3f0 .* GD
+        Z = Z .+ 1e-2f0 .* Gφ .- 1e-3f0 .* GD
     end
     if update_field
-        update!(u.mf, Z)
+        update!(u.mf, Zbase)
     end
     return Z, u.F.U * Z
 end
@@ -1150,7 +1183,7 @@ function (u::ArchetypeUnit)(Xg::AbstractArray{T,3}; will::Bool=true, update_fiel
     return Y
 end
 
-center_global(u::ArchetypeUnit) = u.F.U * u.sf.s
+center_global(u::ArchetypeUnit) = u.F.U * _self_state(u.sf)
 
 struct ArchetypeRouter
     gate::Dense
@@ -1512,7 +1545,7 @@ end
         return path
     end
 
-    function toy_train(; seed=2025)
+    function toy_train(; seed=2025, steps::Int=80, log_every::Int=10, will_start::Int=20, field_start::Int=40, will::Bool=true, update_fields::Bool=true)
         Random.seed!(seed)
         vocab = 12
         d = 64
@@ -1524,25 +1557,33 @@ end
     tokens = [1, 2, 5, 6, 7, 3, 4, 2, 9, 10]
     targets = [2, 1, 5, 6, 7, 4, 3, 1, 10, 9]
 
-    opt = Flux.setup(Flux.Optimisers.Adam(1e-3), m)
+    rule = Flux.Optimisers.OptimiserChain(Flux.Optimisers.ClipNorm(1.0), Flux.Optimisers.Adam(1e-3))
+    opt = Flux.setup(rule, m)
 
-    for step in 1:80
-        gs = Flux.gradient(Flux.params(m)) do
-            L, _ = lossfn(m, tokens, targets)
-            L
-        end
-        Flux.update!(opt, Flux.params(m), gs)
-        forward(m, tokens; update_fields=true)
+	    for step in 1:steps
+	        use_will = will && step >= will_start
+	        use_field = update_fields && step >= field_start
+	        grads = Flux.gradient(m) do model
+	            L, _ = lossfn(model, tokens, targets; update_fields=false, will=use_will)
+	            L
+	        end
+	        if SemioticTransformer._tree_all_finite(grads[1])
+	            Flux.update!(opt, m, grads[1])
+	        else
+	            @warn "non-finite gradient; skipping update" step=step will=use_will update_fields=use_field
+	        end
+	        forward(m, tokens; update_fields=use_field, will=use_will)
 
-        if step % 10 == 0
-            L, parts = lossfn(m, tokens, targets)
-            @info "step=$step" loss=L parts
+        if log_every > 0 && step % log_every == 0
+            L, parts = lossfn(m, tokens, targets; update_fields=false, will=use_will)
+            @info "step=$step" loss=L will=use_will update_fields=use_field parts
         end
     end
     m
     end
 
-    function train_with_time(; seed=2025, steps=200, λ_time=T(1e-2), trace::Bool=false, save_trace::Union{Nothing,String}=nothing)
+    function train_with_time(; seed=2025, steps=200, λ_time=T(1e-2), trace::Bool=false, save_trace::Union{Nothing,String}=nothing,
+            log_every::Int=20, will_start::Int=20, field_start::Int=40, will::Bool=true, update_fields::Bool=true)
         Random.seed!(seed)
         vocab = 12
         d = 64
@@ -1554,28 +1595,35 @@ end
         tokens = [1, 2, 5, 6, 7, 3, 4, 2, 9, 10]
         targets = [2, 1, 5, 6, 7, 4, 3, 1, 10, 9]
 
-        opt = Flux.setup(Flux.Optimisers.Adam(1e-3), m)
+        rule = Flux.Optimisers.OptimiserChain(Flux.Optimisers.ClipNorm(1.0), Flux.Optimisers.Adam(1e-3))
+        opt = Flux.setup(rule, m)
         dev = DevState()
         logs = trace ? Any[] : nothing
 
-        for step in 1:steps
-            _ = Float32(step / steps)
+	        for step in 1:steps
+	            use_will = will && step >= will_start
+	            use_field = update_fields && step >= field_start
+	            _ = Float32(step / steps)
 
-            gs = Flux.gradient(Flux.params(m)) do
-                L, _ = total_loss(m, tokens, targets, dev; λ_time=λ_time)
-                L
-            end
-            Flux.update!(opt, Flux.params(m), gs)
+	            grads = Flux.gradient(m) do model
+	                L, _ = total_loss(model, tokens, targets, dev; λ_time=λ_time, update_fields=false, will=use_will)
+	                L
+	            end
+	            if SemioticTransformer._tree_all_finite(grads[1])
+	                Flux.update!(opt, m, grads[1])
+	            else
+	                @warn "non-finite gradient; skipping update" step=step will=use_will update_fields=use_field
+	            end
 
-            Ltot, info = total_loss(m, tokens, targets, dev; λ_time=λ_time)
-            update!(dev, info.parts; flow=info.flow)
+	            Ltot, info = total_loss(m, tokens, targets, dev; λ_time=λ_time, update_fields=use_field, will=use_will)
+	            update!(dev, info.parts; flow=info.flow)
 
             if trace
                 push!(logs, devstate_trace_row(step, Ltot, info, dev))
             end
 
-            if step % 20 == 0
-                @info "step=$step" L=Ltot dev=dev flow=info.flow parts=info.parts
+            if log_every > 0 && step % log_every == 0
+                @info "step=$step" L=Ltot will=use_will update_fields=use_field dev=dev flow=info.flow parts=info.parts
             end
         end
 
@@ -1595,17 +1643,17 @@ end # module Archetypal
 
 struct CognitiveModel
     emb::Embedding
-    local::SemioticModel
-    global::Archetypal.ArchetypalModel
+    local_model::SemioticModel
+    global_model::Archetypal.ArchetypalModel
 end
 @functor CognitiveModel
 
 function CognitiveModel(emb::Embedding; classes::Int=size(emb.weight, 2),
         local_layers::Int=2, local_H::Int=3, local_k::Int=8, local_z::Int=div(size(emb.weight, 1), 2), local_square=nothing, local_squares=nothing,
         global_K::Int=6, global_ds::Int=div(size(emb.weight, 1), 2), global_r::Int=32, global_λ_pair::T=0.5f0, allowed_pairs::Union{Nothing,Vector{Tuple{Int,Int}}}=nothing)
-    local = SemioticModel(emb; layers=local_layers, H=local_H, k=local_k, z=local_z, classes=classes, square=local_square, squares=local_squares)
-    global = Archetypal.ArchetypalModel(emb; K=global_K, ds=global_ds, r=global_r, λ_pair=global_λ_pair, classes=classes, allowed_pairs=allowed_pairs)
-    CognitiveModel(emb, local, global)
+    local_model = SemioticModel(emb; layers=local_layers, H=local_H, k=local_k, z=local_z, classes=classes, square=local_square, squares=local_squares)
+    global_model = Archetypal.ArchetypalModel(emb; K=global_K, ds=global_ds, r=global_r, λ_pair=global_λ_pair, classes=classes, allowed_pairs=allowed_pairs)
+    CognitiveModel(emb, local_model, global_model)
 end
 
 function CognitiveModel(vocab::Int, d::Int; classes::Int=vocab, kw...)
@@ -1613,9 +1661,9 @@ function CognitiveModel(vocab::Int, d::Int; classes::Int=vocab, kw...)
     return CognitiveModel(emb; classes=classes, kw...)
 end
 
-function coupling_penalty(local::SemioticModel, global::Archetypal.ArchetypalModel; max_pairs::Int=typemax(Int))
-    P = local.blocks[end].mf.P
-    centers = [center_global(u) for u in global.block.units]
+function coupling_penalty(local_model::SemioticModel, global_model::Archetypal.ArchetypalModel; max_pairs::Int=typemax(Int))
+    P = local_model.blocks[end].mf.P
+    centers = [center_global(u) for u in global_model.block.units]
     K = min(size(P, 2), length(centers), max_pairs)
     K == 0 && return zero(T)
     acc = zero(T)
@@ -1625,9 +1673,9 @@ function coupling_penalty(local::SemioticModel, global::Archetypal.ArchetypalMod
     return acc / K
 end
 
-function coupling_matrix(local::SemioticModel, global::Archetypal.ArchetypalModel)
-    P = local.blocks[end].mf.P
-    centers = [center_global(u) for u in global.block.units]
+function coupling_matrix(local_model::SemioticModel, global_model::Archetypal.ArchetypalModel)
+    P = local_model.blocks[end].mf.P
+    centers = [center_global(u) for u in global_model.block.units]
     ncenters = length(centers)
     nproto = size(P, 2)
     (ncenters == 0 || nproto == 0) && return zeros(T, ncenters, nproto)
@@ -1641,8 +1689,8 @@ function coupling_matrix(local::SemioticModel, global::Archetypal.ArchetypalMode
     return M
 end
 
-function coupling_profile(local::SemioticModel, global::Archetypal.ArchetypalModel)
-    M = coupling_matrix(local, global)
+function coupling_profile(local_model::SemioticModel, global_model::Archetypal.ArchetypalModel)
+    M = coupling_matrix(local_model, global_model)
     proto_min = size(M, 2) == 0 ? T[] : vec(mapslices(minimum, M; dims=1))
     center_min = size(M, 1) == 0 ? T[] : vec(mapslices(minimum, M; dims=2))
     return (; matrix=M, proto_min, center_min)
@@ -1672,13 +1720,12 @@ function save_coupling_matrix(path::AbstractString, M)
 end
 
 function forward(m::CognitiveModel, X; update_fields::Bool=false, will_local::Bool=true, will_global::Bool=true)
-    local_logits, KL, recL, acts_local = forward(m.local, X; update_field=update_fields, will=will_local)
-    global_logits, acts_global, W, cache_global = forward(m.global, X; update_fields=update_fields, will=will_global)
-    return (
-        local = (; logits=local_logits, KL=KL, recL=recL, acts=acts_local),
-        global = (; logits=global_logits, acts=acts_global, weights=W, cache=cache_global),
-        psi = psi_state(m.local, acts_local),
-    )
+    local_logits, KL, recL, acts_local = forward(m.local_model, X; update_field=update_fields, will=will_local)
+    global_logits, acts_global, W, cache_global = forward(m.global_model, X; update_fields=update_fields, will=will_global)
+    local_part = (; logits=local_logits, KL=KL, recL=recL, acts=acts_local)
+    global_part = (; logits=global_logits, acts=acts_global, weights=W, cache=cache_global)
+    psi = psi_state(m.local_model, acts_local)
+    return NamedTuple{(:local, :global, :psi)}((local_part, global_part, psi))
 end
 
 function forward(m::CognitiveModel, tokens::AbstractVector{<:Integer}; update_fields::Bool=false, will_local::Bool=true, will_global::Bool=true)
@@ -1708,21 +1755,23 @@ function lossfn(m::CognitiveModel, tokens, targets; pad_token::Union{Nothing,Int
         λ_couple::T=T(1e-3), λ_time::T=T(0f0), dev_state::Union{Nothing,Archetypal.DevState}=nothing,
         update_fields::Bool=false, will_local::Bool=true, will_global::Bool=true)
     X = m.emb(tokens)
-    local_logits, KL, recL, acts_local = forward(m.local, X; update_field=update_fields, will=will_local)
-    L_local, parts_local = _semiotic_loss_from_forward(m.local, local_logits, acts_local, targets; KL=KL, recL=recL, pad_token=pad_token, λ_square=λ_square, λ_neg=λ_neg, λ_KL=λ_KL, λ_rec=λ_rec, λ_self=λ_self, λ_jnd=λ_jnd, λ_instab=λ_instab, ε_instab=ε_instab, instab_samples=instab_samples)
+    local_logits, KL, recL, acts_local = forward(m.local_model, X; update_field=update_fields, will=will_local)
+    L_local, parts_local = _semiotic_loss_from_forward(m.local_model, local_logits, acts_local, targets; KL=KL, recL=recL, pad_token=pad_token, λ_square=λ_square, λ_neg=λ_neg, λ_KL=λ_KL, λ_rec=λ_rec, λ_self=λ_self, λ_jnd=λ_jnd, λ_instab=λ_instab, ε_instab=ε_instab, instab_samples=instab_samples)
 
-    global_logits, acts_global, W, cache_global = forward(m.global, X; update_fields=update_fields, will=will_global)
-    L_global, parts_global = _archetypal_loss_from_forward(m.global, global_logits, acts_global, cache_global.locals, targets; pad_token=pad_token, λ_struct=λ_struct, λ_rules=λ_rules, λ_jnd=λ_jnd, λ_mono=λ_mono)
+    global_logits, acts_global, W, cache_global = forward(m.global_model, X; update_fields=update_fields, will=will_global)
+    L_global, parts_global = _archetypal_loss_from_forward(m.global_model, global_logits, acts_global, cache_global.locals, targets; pad_token=pad_token, λ_struct=λ_struct, λ_rules=λ_rules, λ_jnd=λ_jnd, λ_mono=λ_mono)
 
     L_time = zero(T)
     flow = nothing
     if dev_state !== nothing && λ_time != 0
-        L_time, flow = Archetypal.time_dynamics_loss(m.global.block, acts_global, W, dev_state; λ_time=λ_time)
+        L_time, flow = Archetypal.time_dynamics_loss(m.global_model.block, acts_global, W, dev_state; λ_time=λ_time)
     end
 
-    Lcouple = coupling_penalty(m.local, m.global)
+    Lcouple = coupling_penalty(m.local_model, m.global_model)
     L = L_local + λ_global * L_global + λ_couple * Lcouple + L_time
-    return L, (; local=parts_local, global=parts_global, Lcouple, L_time=L_time, flow=flow, psi=psi_state(m.local, acts_local))
+    psi = psi_state(m.local_model, acts_local)
+    parts = NamedTuple{(:local, :global, :Lcouple, :L_time, :flow, :psi)}((parts_local, parts_global, Lcouple, L_time, flow, psi))
+    return L, parts
 end
 
 function cognitive_probe(; vocab::Int=16, d::Int=24, seq::Int=8, seed::Int=0,
@@ -1743,15 +1792,15 @@ function cognitive_probe(; vocab::Int=16, d::Int=24, seq::Int=8, seed::Int=0,
     # Grab ψ snapshot from a forward pass for diagnostics before computing losses
     forward_out = forward(cog, tokens; update_fields=true)
     psi = forward_out.psi
-    mf = cog.local.blocks[end].mf
-    df = cog.local.blocks[end].df
+    mf = cog.local_model.blocks[end].mf
+    df = cog.local_model.blocks[end].df
 
     instab = meaning_instability(mf, psi.X; ε=ε_instab, samples=instab_samples)
     sweep = meaning_instability_profile(mf, psi.X; epsilons=epsilons, samples=instab_samples)
     spark = instability_sparkline(sweep; width=profile_width)
     isnothing(save_profile) || save_instability_profile(save_profile, sweep)
 
-    coupling = coupling_profile(cog.local, cog.global)
+    coupling = coupling_profile(cog.local_model, cog.global_model)
     coupling_spark = coupling_sparkline(coupling.proto_min; width=profile_width)
     coupling_heat = ascii_heatmap(coupling.matrix)
     coupling_path = save_coupling
@@ -1781,10 +1830,12 @@ function cognitive_probe(; vocab::Int=16, d::Int=24, seq::Int=8, seed::Int=0,
         @info "cognitive bridge probe" L_total=L Lcouple=parts.Lcouple L_time=parts.L_time dev_state=dev_state instab sweep spark coupling_spark coupling_heat coupling_path heatmaps
     end
 
-    return (; Ltotal=L, tokens, psi=parts.psi, Lcouple=parts.Lcouple,
-            local=parts.local, global=parts.global, instab, sweep, spark,
-            coupling=(; coupling..., spark=coupling_spark, path=coupling_path), heatmaps,
-            L_time=parts.L_time, flow=parts.flow, dev_state=dev_state)
+    local_part = parts.local
+    global_part = parts.global
+    coupling_blob = (; coupling..., spark=coupling_spark, path=coupling_path)
+    return NamedTuple{(:Ltotal, :tokens, :psi, :Lcouple, :local, :global, :instab, :sweep, :spark, :coupling, :heatmaps, :L_time, :flow, :dev_state)}(
+        (L, tokens, parts.psi, parts.Lcouple, local_part, global_part, instab, sweep, spark, coupling_blob, heatmaps, parts.L_time, parts.flow, dev_state)
+    )
 end
 
 function _flowval(flow, field::Symbol)
@@ -1823,14 +1874,14 @@ function cognitive_trace(; vocab::Int=16, d::Int=24, seq::Int=8, steps::Int=16, 
         tokens = rand(1:vocab, seq)
         forward_out = forward(cog, tokens; update_fields=true)
         psi = forward_out.psi
-        mf = cog.local.blocks[end].mf
+        mf = cog.local_model.blocks[end].mf
 
         instab = meaning_instability(mf, psi.X; ε=ε_instab, samples=instab_samples)
         sweep = meaning_instability_profile(mf, psi.X; epsilons=epsilons, samples=instab_samples)
         spark = instability_sparkline(sweep; width=profile_width)
         isnothing(profile_path) || save_instability_profile(profile_path, sweep)
 
-        coupling = coupling_profile(cog.local, cog.global)
+        coupling = coupling_profile(cog.local_model, cog.global_model)
         coupling_spark = coupling_sparkline(coupling.proto_min; width=profile_width)
         coupling_heat = ascii_heatmap(coupling.matrix)
         if profile_path isa AbstractString

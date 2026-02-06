@@ -63,7 +63,7 @@ end
     @test size(out.local.logits) == (vocab, length(context))
     @test out.psi isa SemioticTransformer.PsiState
     @test out.psi.X === out.local.acts
-    @test cog.emb === cog.local.emb === cog.global.emb
+    @test cog.emb === cog.local_model.emb === cog.global_model.emb
 
     loss, parts = SemioticTransformer.lossfn(cog, context, targets; λ_couple=1f-3, λ_global=0.5f0)
     @test isfinite(loss)
@@ -71,7 +71,7 @@ end
     @test isfinite(parts.global.Lce)
     @test parts.Lcouple >= 0
 
-    cpen = SemioticTransformer.coupling_penalty(cog.local, cog.global)
+    cpen = SemioticTransformer.coupling_penalty(cog.local_model, cog.global_model)
     @test cpen >= 0
 
     probe = SemioticTransformer.cognitive_probe(; vocab=vocab, d=d, seq=6, seed=7,
