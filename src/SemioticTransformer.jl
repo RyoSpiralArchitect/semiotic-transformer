@@ -881,7 +881,7 @@ module Archetypal
 using Flux, LinearAlgebra, Random, NNlib, Functors
 import ..SemioticTransformer
     using ..SemioticTransformer: T, Negation, negation_penalty, DifferenceField, difference_matrix,
-        MeaningField, potential, potential_grad, MeaningChainLayer, SelfField, coniunctio,
+        MeaningField, potential, potential_grad, MeaningChainLayer, SelfField, coniunctio, negate,
         _apply_layernorm, _apply_dense, next_token_pairs, _ce_loss
     import ..SemioticTransformer: update!
 
