@@ -880,11 +880,11 @@ module Archetypal
 
 using Flux, LinearAlgebra, Random, NNlib, Functors
 using Statistics: mean
-import ..SemioticTransformer
-    using ..SemioticTransformer: T, Negation, negation_penalty, DifferenceField, difference_matrix,
-        MeaningField, potential, potential_grad, MeaningChainLayer, SelfField, coniunctio, negate,
-        _apply_layernorm, _apply_dense, next_token_pairs, _ce_loss
-    import ..SemioticTransformer: update!
+	import ..SemioticTransformer
+	    using ..SemioticTransformer: T, Negation, negation_penalty, DifferenceField, difference_matrix,
+	        MeaningField, potential, potential_grad, will_step!, MeaningChainLayer, SelfField, coniunctio, negate,
+	        _apply_layernorm, _apply_dense, next_token_pairs, _ce_loss
+	    import ..SemioticTransformer: update!
 
     struct DevState
         m::Float32
@@ -1136,43 +1136,31 @@ function ArchetypeUnit(tag::UInt8, d::Int, ds::Int; k::Int=6, H::Int=3)
     )
 end
 
-"""Return local codes and global projection for a single sequence."""
-function _unit_forward(u::ArchetypeUnit, Xg::AbstractMatrix{T}; will::Bool=true, update_field::Bool=false)
-    X = u.F.V * Xg
-    Φ = potential(u.mf, X)
-    Y = X .+ u.mha(u.norm1(X), Φ)
-    Zbase = Y .+ u.chain(u.norm2(Y), Φ)
-    Z = Zbase
-    if will
-        Gφ = similar(Z)
-        for j in 1:size(Z, 2)
-            Gφ[:, j] = potential_grad(u.mf, view(Z, :, j))
-        end
-        GD = zeros(T, size(Z, 1), size(Z, 2))
-        μ = mean(Z; dims=2)
-        @inbounds for j in 1:size(Z, 2)
-            GD[:, j] .= 2f0 .* (u.df.M * (size(Z, 2) .* view(Z, :, j) .- vec(μ)))
-        end
-        Z = Z .+ 1e-2f0 .* Gφ .- 1e-3f0 .* GD
-    end
-    if update_field
-        update!(u.mf, Zbase)
-    end
-    return Z, u.F.U * Z
-end
+	"""Return local codes and global projection for a single sequence."""
+	function _unit_forward(u::ArchetypeUnit, Xg::AbstractMatrix{T}; will::Bool=true, update_field::Bool=false)
+	    X = u.F.V * Xg
+	    Φ = potential(u.mf, X)
+	    Y = X .+ u.mha(u.norm1(X), Φ)
+	    Zbase = Y .+ u.chain(u.norm2(Y), Φ)
+	    Z = will ? will_step!(Zbase, u.mf, u.df) : Zbase
+	    if update_field
+	        update!(u.mf, Zbase)
+	    end
+	    return Z, u.F.U * Z
+	end
 
-"""Return local codes and global projection for batched sequences (d×n×b)."""
-function _unit_forward(u::ArchetypeUnit, Xg::AbstractArray{T,3}; will::Bool=true, update_field::Bool=false)
-    batches = size(Xg, 3)
-    locals = Array{T}(undef, u.ds, size(Xg, 2), batches)
-    globals = Array{T}(undef, size(u.F.U, 1), size(Xg, 2), batches)
-    @inbounds @views for b in 1:batches
-        loc, glob = _unit_forward(u, view(Xg, :, :, b); will=will, update_field=update_field)
-        locals[:, :, b] .= loc
-        globals[:, :, b] .= glob
-    end
-    return locals, globals
-end
+	"""Return local codes and global projection for batched sequences (d×n×b)."""
+	function _unit_forward(u::ArchetypeUnit, Xg::AbstractArray{T,3}; will::Bool=true, update_field::Bool=false)
+	    batches = size(Xg, 3)
+	    pairs = [_unit_forward(u, view(Xg, :, :, b); will=will, update_field=update_field) for b in 1:batches]
+	    if batches == 1
+	        loc, glob = pairs[1]
+	        return reshape(loc, size(loc, 1), size(loc, 2), 1), reshape(glob, size(glob, 1), size(glob, 2), 1)
+	    end
+	    locals = cat((p[1] for p in pairs)...; dims=3)
+	    globals = cat((p[2] for p in pairs)...; dims=3)
+	    return locals, globals
+	end
 
 function (u::ArchetypeUnit)(Xg::AbstractMatrix{T}; will::Bool=true, update_field::Bool=false)
     _, Y = _unit_forward(u, Xg; will=will, update_field=update_field)
@@ -1224,48 +1212,37 @@ function SceneMonoid(d::Int, ds::Int, K::Int, r::Int; λ_pair=T(0.5), allowed_pa
     SceneMonoid(Flux.glorot_uniform(d, r), [Flux.glorot_uniform(r, ds) for _ in 1:K], ones(T, r), λ_pair, uniq)
 end
 
-"""Compose pairwise scene interactions for a single sequence."""
-function scene_compose(sm::SceneMonoid, locals::Vector{<:AbstractMatrix{T}}, W::AbstractMatrix{T})
-    K = length(locals)
-    rdim = size(sm.U, 2)
-    n = size(W, 2)
-    R = [sm.P[k] * locals[k] for k in 1:K]  # r×n projections
-    rsum = zeros(T, rdim, n)
-    @inbounds for i in 1:n
-        wi = view(W, :, i)
-        for (a, b) in sm.pairs
-            wpair = wi[a] * wi[b]
-            if wpair > 0
-                rsum[:, i] .+= wpair .* (view(R[a], :, i) .* view(R[b], :, i))
-            end
-        end
-    end
-    sm.λ_pair .* (sm.U * rsum)
-end
+	"""Compose pairwise scene interactions for a single sequence."""
+	function scene_compose(sm::SceneMonoid, locals::Vector{<:AbstractMatrix{T}}, W::AbstractMatrix{T})
+	    K = length(locals)
+	    rdim = size(sm.U, 2)
+	    n = size(W, 2)
+	    R = [sm.P[k] * locals[k] for k in 1:K]  # r×n projections
+	    cols = [
+	        begin
+	            wi = view(W, :, i)
+	            reduce(+, (wi[a] * wi[b] .* (view(R[a], :, i) .* view(R[b], :, i)) for (a, b) in sm.pairs);
+	                init=zeros(T, rdim))
+	        end for i in 1:n
+	    ]
+	    rsum = hcat(cols...)
+	    return sm.λ_pair .* (sm.U * rsum)
+	end
 
-"""Compose pairwise scene interactions for batched sequences."""
-function scene_compose(sm::SceneMonoid, locals::Vector{<:AbstractArray{T,3}}, W::AbstractArray{T,3})
-    K = length(locals)
-    rdim = size(sm.U, 2)
-    n = size(W, 2)
-    batches = size(W, 3)
-    Y = zeros(T, size(sm.U, 1), n, batches)
-    @inbounds @views for b in 1:batches
-        R = [sm.P[k] * view(locals[k], :, :, b) for k in 1:K]
-        rsum = zeros(T, rdim, n)
-        for i in 1:n
-            wi = view(W, :, i, b)
-            for (a, c) in sm.pairs
-                wpair = wi[a] * wi[c]
-                if wpair > 0
-                    rsum[:, i] .+= wpair .* (view(R[a], :, i) .* view(R[c], :, i))
-                end
-            end
-        end
-        Y[:, :, b] .= sm.λ_pair .* (sm.U * rsum)
-    end
-    Y
-end
+	"""Compose pairwise scene interactions for batched sequences."""
+	function scene_compose(sm::SceneMonoid, locals::Vector{<:AbstractArray{T,3}}, W::AbstractArray{T,3})
+	    K = length(locals)
+	    batches = size(W, 3)
+	    if batches == 1
+	        scene = scene_compose(sm, [view(locals[k], :, :, 1) for k in 1:K], view(W, :, :, 1))
+	        return reshape(scene, size(scene, 1), size(scene, 2), 1)
+	    end
+	    scenes = (
+	        scene_compose(sm, [view(locals[k], :, :, b) for k in 1:K], view(W, :, :, b))
+	        for b in 1:batches
+	    )
+	    return cat(scenes...; dims=3)
+	end
 
 function monoid_penalty(sm::SceneMonoid, locals::Vector{<:AbstractMatrix{T}}; λ_unit=T(1e-3), λ_assoc=T(1e-3), samples::Int=4)
     K = length(locals)
@@ -1334,36 +1311,34 @@ function ArchetypalBlock(d::Int; K::Int=6, ds::Int=div(d, 2), r::Int=32, λ_pair
     )
 end
 
-function (ab::ArchetypalBlock)(X::AbstractMatrix{T}; will::Bool=true, update_fields::Bool=false)
-    W = route(ab.router, X)
-    Y = zeros(T, size(X, 1), size(X, 2))
-    locals = Vector{Matrix{T}}(undef, length(ab.units))
-    for (k, u) in enumerate(ab.units)
-        locals[k], Yk = _unit_forward(u, X; will=will, update_field=update_fields)
-        Y .+= Yk .* reshape(W[k, :], 1, :)
-    end
-    scene = scene_compose(ab.monoid, locals, W)
-    return Y .+ scene, W, (; locals)
-end
+	function (ab::ArchetypalBlock)(X::AbstractMatrix{T}; will::Bool=true, update_fields::Bool=false)
+	    W = route(ab.router, X)
+	    pairs = [_unit_forward(u, X; will=will, update_field=update_fields) for u in ab.units]
+	    locals = [p[1] for p in pairs]
+	    Yks = [pairs[k][2] .* reshape(W[k, :], 1, :) for k in 1:length(pairs)]
+	    Y = reduce(+, Yks)
+	    scene = scene_compose(ab.monoid, locals, W)
+	    return Y .+ scene, W, (; locals)
+	end
 
-function (ab::ArchetypalBlock)(X::AbstractArray{T,3}; will::Bool=true, update_fields::Bool=false)
-    _, n, batches = size(X)
-    K = length(ab.units)
-    W = Array{T}(undef, K, n, batches)
-    Y = zeros(T, size(X)...)
-    locals = Vector{Array{T,3}}(undef, K)
-    @inbounds @views for b in 1:batches
-        W[:, :, b] = route(ab.router, view(X, :, :, b))
-    end
-    for (k, u) in enumerate(ab.units)
-        locals[k], Yk = _unit_forward(u, X; will=will, update_field=update_fields)
-        @inbounds @views for b in 1:batches
-            Y[:, :, b] .+= view(Yk, :, :, b) .* reshape(W[k, :, b], 1, :)
-        end
-    end
-    scene = scene_compose(ab.monoid, locals, W)
-    return Y .+ scene, W, (; locals)
-end
+	function (ab::ArchetypalBlock)(X::AbstractArray{T,3}; will::Bool=true, update_fields::Bool=false)
+	    _, n, batches = size(X)
+	    K = length(ab.units)
+	    Ws = [route(ab.router, view(X, :, :, b)) for b in 1:batches]
+	    W = batches == 1 ? reshape(Ws[1], size(Ws[1], 1), size(Ws[1], 2), 1) : cat(Ws...; dims=3)
+
+	    pairs = [_unit_forward(u, X; will=will, update_field=update_fields) for u in ab.units]
+	    locals = [p[1] for p in pairs]
+	    Yks = [
+	        begin
+	            w = reshape(view(W, k, :, :), 1, n, batches)
+	            pairs[k][2] .* w
+	        end for k in 1:K
+	    ]
+	    Y = reduce(+, Yks)
+	    scene = scene_compose(ab.monoid, locals, W)
+	    return Y .+ scene, W, (; locals)
+	end
 
 function archetype_rules_loss(ab::ArchetypalBlock; λ_self=T(1e-2), λ_pair=T(1e-2), margin=T(1.4))
     K = length(ab.units)
