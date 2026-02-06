@@ -1183,7 +1183,7 @@ function (u::ArchetypeUnit)(Xg::AbstractArray{T,3}; will::Bool=true, update_fiel
     return Y
 end
 
-center_global(u::ArchetypeUnit) = u.F.U * _self_state(u.sf)
+center_global(u::ArchetypeUnit) = u.F.U * SemioticTransformer._self_state(u.sf)
 
 struct ArchetypeRouter
     gate::Dense
