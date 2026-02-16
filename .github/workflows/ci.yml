@@ -16,3 +16,5 @@ jobs:
         run: julia --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate()'
       - name: Compile and load
         run: julia --project=. -e 'using SemioticTransformer; println("Loaded OK")'
+      - name: Run tests
+        run: julia --project=. -e 'using Pkg; Pkg.test()'
