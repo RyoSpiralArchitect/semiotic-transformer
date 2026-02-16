@@ -67,6 +67,13 @@ multi-path meaning recomposition.
    SEMIOTIC_SEED=42 julia scripts/toy_train.jl
    ```
 
+   To run the archetypal toy loop directly (same activation + instantiate
+   behavior), use:
+
+   ```bash
+   SEMIOTIC_SEED=42 julia scripts/archetypal_toy_train.jl
+   ```
+
 4. Import and call the same demo from the REPL or a script:
 
    ```julia
@@ -457,4 +464,3 @@ A minimal GitHub Actions workflow (`.github/workflows/ci.yml`) is provided to
 instantiate the environment and ensure `SemioticTransformer.jl` loads cleanly
 via `include`. This guards against syntax slips in the monolithic module even
 when no standalone tests are present.
-
