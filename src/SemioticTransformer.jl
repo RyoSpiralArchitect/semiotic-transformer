@@ -1311,34 +1311,50 @@ function ArchetypalBlock(d::Int; K::Int=6, ds::Int=div(d, 2), r::Int=32, λ_pair
     )
 end
 
-	function (ab::ArchetypalBlock)(X::AbstractMatrix{T}; will::Bool=true, update_fields::Bool=false)
-	    W = route(ab.router, X)
-	    pairs = [_unit_forward(u, X; will=will, update_field=update_fields) for u in ab.units]
-	    locals = [p[1] for p in pairs]
-	    Yks = [pairs[k][2] .* reshape(W[k, :], 1, :) for k in 1:length(pairs)]
-	    Y = reduce(+, Yks)
-	    scene = scene_compose(ab.monoid, locals, W)
-	    return Y .+ scene, W, (; locals)
-	end
+				function (ab::ArchetypalBlock)(X::AbstractMatrix{T}; will::Bool=true, update_fields::Bool=false)
+				    W = route(ab.router, X)
+				    locals = map(ab.units) do u
+				        loc, _ = _unit_forward(u, X; will=will, update_field=false)
+				        loc
+				    end
+				    Yks = map(enumerate(ab.units)) do (k, u)
+				        _, glob = _unit_forward(u, X; will=will, update_field=false)
+				        glob .* reshape(view(W, k, :), 1, :)
+				    end
+				    Y = reduce(+, Yks)
+				    scene = scene_compose(ab.monoid, locals, W)
+				    if update_fields
+				        for (u, loc) in zip(ab.units, locals)
+				            update!(u.mf, loc)
+				        end
+				    end
+				    return Y .+ scene, W, (; locals)
+				end
 
-	function (ab::ArchetypalBlock)(X::AbstractArray{T,3}; will::Bool=true, update_fields::Bool=false)
-	    _, n, batches = size(X)
-	    K = length(ab.units)
-	    Ws = [route(ab.router, view(X, :, :, b)) for b in 1:batches]
-	    W = batches == 1 ? reshape(Ws[1], size(Ws[1], 1), size(Ws[1], 2), 1) : cat(Ws...; dims=3)
+				function (ab::ArchetypalBlock)(X::AbstractArray{T,3}; will::Bool=true, update_fields::Bool=false)
+				    _, n, batches = size(X)
+				    K = length(ab.units)
+				    Ws = [route(ab.router, view(X, :, :, b)) for b in 1:batches]
+				    W = batches == 1 ? reshape(Ws[1], size(Ws[1], 1), size(Ws[1], 2), 1) : cat(Ws...; dims=3)
 
-	    pairs = [_unit_forward(u, X; will=will, update_field=update_fields) for u in ab.units]
-	    locals = [p[1] for p in pairs]
-	    Yks = [
-	        begin
-	            w = reshape(view(W, k, :, :), 1, n, batches)
-	            pairs[k][2] .* w
-	        end for k in 1:K
-	    ]
-	    Y = reduce(+, Yks)
-	    scene = scene_compose(ab.monoid, locals, W)
-	    return Y .+ scene, W, (; locals)
-	end
+				    Yks = map(enumerate(ab.units)) do (k, u)
+				        _, glob = _unit_forward(u, X; will=will, update_field=false)
+				        w = reshape(view(W, k, :, :), 1, n, batches)
+				        glob .* w
+				    end
+				    locals = map(ab.units) do u
+				        loc, _ = _unit_forward(u, X; will=will, update_field=false)
+				        loc
+				    end
+				    Y = reduce(+, Yks)
+				    scene = scene_compose(ab.monoid, locals, W)
+				    if update_fields
+				        for (u, loc) in zip(ab.units, locals)
+				            update!(u.mf, loc)
+				        end
+				    end
+				    return Y .+ scene, W, (; locals)
+				end
 
 function archetype_rules_loss(ab::ArchetypalBlock; λ_self=T(1e-2), λ_pair=T(1e-2), margin=T(1.4))
     K = length(ab.units)
