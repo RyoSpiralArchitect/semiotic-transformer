@@ -123,6 +123,30 @@ forward pass, and loss helpers on a tiny synthetic batch:
 julia --project=. -e 'using Pkg; Pkg.test()'
 ```
 
+## Train on your own text (char-level)
+
+If you have a plain text file and just want to see the model train end-to-end on
+real data, you can start with the built-in character-level trainer. It builds a
+vocabulary from the unique characters in the file, samples random windows, and
+trains a next-token predictor.
+
+```bash
+julia scripts/train_char_lm.jl path/to/text.txt
+SEMIOTIC_SAVE=out/model.ser julia scripts/train_char_lm.jl path/to/text.txt
+```
+
+To generate text from a saved run:
+
+```bash
+julia scripts/generate_char_lm.jl out/model.ser "Once upon a time"
+```
+
+To train the archetypal model instead of the semiotic one:
+
+```bash
+SEMIOTIC_MODEL=archetypal SEMIOTIC_SAVE=out/archetypal.ser julia scripts/train_char_lm.jl path/to/text.txt
+```
+
 By default the toy example wires a SemioticSquare over the first four vocabulary
 indices. The helper `lossfn(model, sequence)` will shift the sequence internally
 (tokens `1:n-1` predict `2:n`), add the summed square loss across all registered
