@@ -43,7 +43,7 @@ end
 function usage()
     println("""
 Usage:
-  julia scripts/train_char_lm.jl <text_path>
+  julia scripts/train_char_lm.jl <text_path_or_dir> [more_paths...]
 
 Env knobs (optional):
   SEMIOTIC_MODEL=semiotic|archetypal   (default: semiotic)
@@ -71,11 +71,44 @@ Env knobs (optional):
 """)
 end
 
-function load_text(path::AbstractString; max_chars::Int=200_000)
-    txt = read(path, String)
-    if max_chars > 0 && ncodeunits(txt) > max_chars
-        txt = first(txt, max_chars)
+function collect_text_files(inputs::Vector{String})
+    files = String[]
+    for input in inputs
+        if isdir(input)
+            for (root, _, names) in walkdir(input)
+                for name in sort(names)
+                    endswith(lowercase(name), ".txt") || continue
+                    push!(files, joinpath(root, name))
+                end
+            end
+        elseif isfile(input)
+            push!(files, input)
+        else
+            error("path not found: $input")
+        end
     end
+    isempty(files) && error("no .txt files found in inputs")
+    return sort!(unique(files))
+end
+
+function load_text(paths::Vector{String}; max_chars::Int=200_000)
+    io = IOBuffer()
+    written = 0
+    for (index, path) in enumerate(paths)
+        txt = read(path, String)
+        if max_chars > 0
+            remaining = max_chars - written
+            remaining <= 0 && break
+            ncodeunits(txt) > remaining && (txt = first(txt, remaining))
+        end
+        print(io, txt)
+        written += ncodeunits(txt)
+        if index < length(paths) && (max_chars <= 0 || written + 2 <= max_chars)
+            print(io, "\n\n")
+            written += 2
+        end
+    end
+    txt = String(take!(io))
     return txt
 end
 
@@ -189,9 +222,9 @@ end
 function main()
     if isempty(ARGS)
         usage()
-        error("missing <text_path>")
+        error("missing <text_path_or_dir>")
     end
-    path = ARGS[1]
+    inputs = collect(String, ARGS)
     model_kind = lowercase(strip(envstr("SEMIOTIC_MODEL", "semiotic")))
     seed = envint("SEMIOTIC_SEED", 2025)
     d = envint("SEMIOTIC_D", 64)
@@ -207,7 +240,8 @@ function main()
     field_start = envint("SEMIOTIC_FIELD_START", 40)
     save_path = envstr("SEMIOTIC_SAVE", "")
 
-    txt = load_text(path; max_chars=max_chars)
+    text_files = collect_text_files(inputs)
+    txt = load_text(text_files; max_chars=max_chars)
     tokens, chars = build_vocab(txt)
     vocab = length(chars)
     vocab >= 2 || error("vocab too small (need >=2 unique chars)")
@@ -220,7 +254,7 @@ function main()
     train_tokens = tokens[1:train_n]
     val_tokens = tokens[(train_n + 1):end]
 
-    @info "dataset" path=path max_chars=max_chars n_tokens=length(tokens) vocab=vocab train=train_n val=val_n
+    @info "dataset" inputs=inputs files=length(text_files) max_chars=max_chars n_tokens=length(tokens) vocab=vocab train=train_n val=val_n
 
     if model_kind == "semiotic"
         layers = envint("SEMIOTIC_LAYERS", 2)

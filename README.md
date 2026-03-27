@@ -132,6 +132,7 @@ trains a next-token predictor.
 
 ```bash
 julia scripts/train_char_lm.jl path/to/text.txt
+julia scripts/train_char_lm.jl path/to/text_dir
 SEMIOTIC_SAVE=out/model.ser julia scripts/train_char_lm.jl path/to/text.txt
 ```
 
@@ -146,6 +147,9 @@ To train the archetypal model instead of the semiotic one:
 ```bash
 SEMIOTIC_MODEL=archetypal SEMIOTIC_SAVE=out/archetypal.ser julia scripts/train_char_lm.jl path/to/text.txt
 ```
+
+Directories are scanned recursively for `.txt` files, so a corpus folder such as
+`../data` can be passed directly.
 
 By default the toy example wires a SemioticSquare over the first four vocabulary
 indices. The helper `lossfn(model, sequence)` will shift the sequence internally
